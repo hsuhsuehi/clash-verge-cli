@@ -12,6 +12,7 @@ use std::collections::HashMap;
 pub enum InputMode {
     Normal,
     Importing(String),
+    Renaming(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,6 +89,7 @@ pub enum Overlay {
     Help,
     Filter,
     CloseConfirmation,
+    DeleteConfirm,
 }
 
 #[derive(Debug, Default)]
@@ -131,6 +133,8 @@ pub struct App {
     pub connection_selected_index: usize,
     pub log_selected_index: usize,
     pub pending_connection_close: Option<String>,
+    pub pending_delete_uid: Option<String>,
+    pub pending_delete_name: Option<String>,
     pub connection_filter: Option<String>,
     pub log_filter: Option<String>,
     pub runtime_loading: RuntimeLoading,
@@ -170,6 +174,8 @@ impl App {
             connection_selected_index: 0,
             log_selected_index: 0,
             pending_connection_close: None,
+            pending_delete_uid: None,
+            pending_delete_name: None,
             connection_filter: None,
             log_filter: None,
             runtime_loading: RuntimeLoading::default(),

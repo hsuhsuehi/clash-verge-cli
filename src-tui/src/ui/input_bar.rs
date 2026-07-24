@@ -40,6 +40,7 @@ pub fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 return;
             }
             Overlay::Help => {}
+            Overlay::DeleteConfirm => {}
         }
     }
 
@@ -65,6 +66,15 @@ pub fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
         InputMode::Importing(buffer) => {
             let line = Line::from(vec![
                 Span::styled(app.tr("input.url"), Style::default().fg(Color::Cyan)),
+                Span::styled(buffer.clone(), Style::default().fg(Color::White)),
+                Span::styled("|", Style::default().fg(Color::DarkGray)),
+                Span::styled(app.tr("input.submit_cancel"), Style::default().fg(Color::DarkGray)),
+            ]);
+            frame.render_widget(Paragraph::new(line), area);
+        }
+        InputMode::Renaming(buffer) => {
+            let line = Line::from(vec![
+                Span::styled("Rename: ", Style::default().fg(Color::Cyan)),
                 Span::styled(buffer.clone(), Style::default().fg(Color::White)),
                 Span::styled("|", Style::default().fg(Color::DarkGray)),
                 Span::styled(app.tr("input.submit_cancel"), Style::default().fg(Color::DarkGray)),

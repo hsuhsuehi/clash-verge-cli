@@ -52,4 +52,17 @@ pub enum ProfileCommand {
         #[arg(long)]
         all: bool,
     },
+    /// Delete a remote profile
+    Remove {
+        /// Profile UID to remove
+        uid: String,
+    },
+    /// Rename a remote profile
+    Rename {
+        /// Profile UID to rename
+        uid: String,
+        /// New display name
+        #[arg(long)]
+        name: String,
+    },
 }

@@ -112,6 +112,29 @@ fn draw_overlay(frame: &mut ratatui::Frame<'_>, app: &App) {
             frame.render_widget(popup, area);
         }
         Overlay::Filter => {}
+        Overlay::DeleteConfirm => {
+            let target = app
+                .pending_delete_name
+                .as_deref()
+                .unwrap_or_else(|| app.tr("common.unknown"));
+            let popup = Paragraph::new(vec![
+                Line::from(Span::styled(
+                    app.tr("dialog.delete_profile_title"),
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                )),
+                Line::from(format!(
+                    "{}: {target}",
+                    app.tr("dialog.delete_profile_body")
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    app.tr("dialog.delete_confirm_hint"),
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ])
+            .block(Block::bordered().title(app.tr("dialog.delete_profile_title")));
+            frame.render_widget(popup, area);
+        }
     }
 }
 

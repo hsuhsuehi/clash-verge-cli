@@ -147,6 +147,39 @@ impl ProfileStore {
         }
         Ok(refreshed_current)
     }
+
+    /// Remove a remote profile by UID. Returns whether it was the current profile.
+    pub async fn remove_by_uid(&mut self, uid: &str) -> anyhow::Result<bool> {
+        let uid_key = SmartString::from(uid);
+        let was_current = self
+            .profiles
+            .delete_item(&uid_key)
+            .await
+            .context("failed to delete profile")?;
+        self.profiles
+            .save_file()
+            .await
+            .context("failed to save profiles.yaml")?;
+        Ok(was_current)
+    }
+
+    /// Rename a remote profile by UID.
+    pub async fn rename_by_uid(&mut self, uid: &str, name: &str) -> anyhow::Result<()> {
+        let uid_key = SmartString::from(uid);
+        let patch = PrfItem {
+            name: Some(SmartString::from(name)),
+            ..Default::default()
+        };
+        self.profiles
+            .patch_item(&uid_key, &patch)
+            .await
+            .context("failed to rename profile")?;
+        self.profiles
+            .save_file()
+            .await
+            .context("failed to save profiles.yaml")?;
+        Ok(())
+    }
 }
 
 async fn ensure_profile_storage() -> anyhow::Result<()> {

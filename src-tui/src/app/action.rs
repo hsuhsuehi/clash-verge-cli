@@ -31,6 +31,16 @@ pub enum Action {
     },
     ProfileUpdateFailed(String),
 
+    // Profile delete/rename (Phase 2)
+    DeleteProfile,
+    ConfirmDeleteProfile,
+    ProfileDeleted,
+    ProfileDeleteFailed(String),
+    StartRename,
+    ConfirmRename(String),
+    ProfileRenamed,
+    ProfileRenameFailed(String),
+
     // Shell navigation
     SwitchView(View),
     CycleFocus,
@@ -111,6 +121,14 @@ mod tests {
         let _ = Action::CoreExited(137);
         let _ = Action::CoreError("boom".to_string());
         let _ = Action::Quit;
+        let _ = Action::DeleteProfile;
+        let _ = Action::ConfirmDeleteProfile;
+        let _ = Action::ProfileDeleted;
+        let _ = Action::ProfileDeleteFailed("boom".to_string());
+        let _ = Action::StartRename;
+        let _ = Action::ConfirmRename("new-name".to_string());
+        let _ = Action::ProfileRenamed;
+        let _ = Action::ProfileRenameFailed("boom".to_string());
     }
 
     fn assert_send_sync<T: Send + Sync>() {}
