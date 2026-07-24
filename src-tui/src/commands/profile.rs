@@ -51,3 +51,20 @@ pub async fn update(uid: Option<&str>, all: bool) -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+pub async fn remove(uid: &str) -> anyhow::Result<()> {
+    let mut store = ProfileStore::load().await?;
+    let was_current = store.remove_by_uid(uid).await?;
+    println!("removed profile {uid}");
+    if was_current {
+        println!("removed the active profile — no profile is selected now");
+    }
+    Ok(())
+}
+
+pub async fn rename(uid: &str, name: &str) -> anyhow::Result<()> {
+    let mut store = ProfileStore::load().await?;
+    store.rename_by_uid(uid, name).await?;
+    println!("renamed profile {uid} to {name}");
+    Ok(())
+}

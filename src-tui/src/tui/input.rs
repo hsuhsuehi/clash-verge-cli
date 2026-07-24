@@ -86,6 +86,8 @@ pub fn map_key(event: KeyEvent, context: KeyContext<'_>) -> Option<Action> {
         KeyCode::Char('j') | KeyCode::Down => Some(Action::MoveNext),
         KeyCode::Char('k') | KeyCode::Up => Some(Action::MovePrevious),
         KeyCode::Char('i') if context.view == View::Profiles => Some(Action::StartImport),
+        KeyCode::Char('e') if context.view == View::Profiles => Some(Action::StartRename),
+        KeyCode::Char('d') if context.view == View::Profiles => Some(Action::DeleteProfile),
         KeyCode::Enter => Some(Action::Activate),
         KeyCode::Char('u') if context.view == View::Profiles => Some(Action::UpdateProfile),
 

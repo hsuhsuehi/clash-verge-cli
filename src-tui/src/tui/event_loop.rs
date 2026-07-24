@@ -27,7 +27,22 @@ fn dismiss_overlay(app: &mut App) {
     app.overlay = None;
     app.filter = None;
     app.pending_connection_close = None;
+    app.pending_delete_uid = None;
+    app.pending_delete_name = None;
     app.focus = Focus::Menu;
+}
+
+fn begin_delete_confirm(app: &mut App) {
+    if let Some(item) = app.profiles.get(app.selected_index) {
+        let uid = item.uid.as_deref().map(String::from);
+        let name = item.name.as_deref().map(String::from);
+        app.pending_delete_uid = uid;
+        app.pending_delete_name = name;
+        app.overlay = Some(Overlay::DeleteConfirm);
+        app.status_msg = Some("Delete profile? Press d to confirm".into());
+    } else {
+        app.status_msg = Some("No profile selected".into());
+    }
 }
 
 fn begin_connection_close(app: &mut App) {
@@ -378,6 +393,35 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                                     _ => {}
                                 }
                             }
+                            InputMode::Renaming(buffer) => {
+                                match key.code {
+                                    KeyCode::Enter => {
+                                        let name = buffer.clone();
+                                        app.input_mode = InputMode::Normal;
+                                        if !name.trim().is_empty() {
+                                            app.status_msg = Some("Renaming...".into());
+                                            let tx = action_tx.clone();
+                                            tokio::spawn(async move {
+                                                let _ = tx.send(Action::ConfirmRename(name));
+                                            });
+                                        }
+                                    }
+                                    KeyCode::Esc => {
+                                        app.input_mode = InputMode::Normal;
+                                    }
+                                    KeyCode::Backspace => {
+                                        let mut b = buffer.clone();
+                                        b.pop();
+                                        app.input_mode = InputMode::Renaming(b);
+                                    }
+                                    KeyCode::Char(c) => {
+                                        let mut b = buffer.clone();
+                                        b.push(c);
+                                        app.input_mode = InputMode::Renaming(b);
+                                    }
+                                    _ => {}
+                                }
+                            }
                             InputMode::Normal => {
                                 if app.overlay == Some(Overlay::Filter) {
                                     match input::map_key(key, key_context(&app)) {
@@ -412,6 +456,16 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                                             _ => {}
                                         },
                                     }
+                                } else if app.overlay == Some(Overlay::DeleteConfirm) {
+                                    match key.code {
+                                        KeyCode::Char('d') => {
+                                            let _ = action_tx.send(Action::ConfirmDeleteProfile);
+                                        }
+                                        KeyCode::Esc | KeyCode::Char('q') => {
+                                            dismiss_overlay(&mut app);
+                                        }
+                                        _ => {}
+                                    }
                                 } else if let Some(action) = input::map_key(key, key_context(&app)) {
                                     match action {
                                         Action::Quit => break,
@@ -444,6 +498,17 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                                         }
                                         Action::StartImport => {
                                             app.input_mode = InputMode::Importing(String::new());
+                                        }
+                                        Action::StartRename => {
+                                            let name: String = app
+                                                .profiles
+                                                .get(app.selected_index)
+                                                .and_then(|item| item.name.as_deref().map(String::from))
+                                                .unwrap_or_default();
+                                            app.input_mode = InputMode::Renaming(name);
+                                        }
+                                        Action::DeleteProfile => {
+                                            begin_delete_confirm(&mut app);
                                         }
                                         Action::MoveNext => {
                                             if app.focus == Focus::Menu {
@@ -1172,6 +1237,71 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                     }
                     Some(Action::ProfileUpdateFailed(error)) => {
                         app.status_msg = Some(format!("Update failed: {error}"));
+                    }
+                    Some(Action::ConfirmDeleteProfile) => {
+                        if let Some(uid) = app.pending_delete_uid.take() {
+                            app.pending_delete_name = None;
+                            app.overlay = None;
+                            app.status_msg = Some("Deleting...".into());
+                            let tx = action_tx.clone();
+                            tokio::spawn(async move {
+                                match crate::profile_store::store::ProfileStore::load().await {
+                                    Ok(mut store) => match store.remove_by_uid(&uid).await {
+                                        Ok(_) => {
+                                            let _ = tx.send(Action::ProfileDeleted);
+                                        }
+                                        Err(e) => {
+                                            let _ = tx.send(Action::ProfileDeleteFailed(e.to_string()));
+                                        }
+                                    },
+                                    Err(e) => {
+                                        let _ = tx.send(Action::ProfileDeleteFailed(e.to_string()));
+                                    }
+                                }
+                            });
+                        }
+                    }
+                    Some(Action::ProfileDeleted) => {
+                        app.status_msg = Some("Profile deleted".into());
+                        if let Ok(store) = crate::profile_store::store::ProfileStore::load().await {
+                            app.profiles = store.items();
+                            app.selected_index = app.selected_index.min(app.profiles.len().saturating_sub(1));
+                        }
+                    }
+                    Some(Action::ProfileDeleteFailed(error)) => {
+                        app.status_msg = Some(format!("Delete failed: {error}"));
+                    }
+                    Some(Action::ConfirmRename(name)) => {
+                        if let Some(item) = app.profiles.get(app.selected_index) {
+                            if let Some(uid) = item.uid.clone() {
+                                app.status_msg = Some("Renaming...".into());
+                                let tx = action_tx.clone();
+                                tokio::spawn(async move {
+                                    match crate::profile_store::store::ProfileStore::load().await {
+                                        Ok(mut store) => match store.rename_by_uid(&uid, &name).await {
+                                            Ok(_) => {
+                                                let _ = tx.send(Action::ProfileRenamed);
+                                            }
+                                            Err(e) => {
+                                                let _ = tx.send(Action::ProfileRenameFailed(e.to_string()));
+                                            }
+                                        },
+                                        Err(e) => {
+                                            let _ = tx.send(Action::ProfileRenameFailed(e.to_string()));
+                                        }
+                                    }
+                                });
+                            }
+                        }
+                    }
+                    Some(Action::ProfileRenamed) => {
+                        app.status_msg = Some("Profile renamed".into());
+                        if let Ok(store) = crate::profile_store::store::ProfileStore::load().await {
+                            app.profiles = store.items();
+                        }
+                    }
+                    Some(Action::ProfileRenameFailed(error)) => {
+                        app.status_msg = Some(format!("Rename failed: {error}"));
                     }
                     None => break,
                     _ => {}

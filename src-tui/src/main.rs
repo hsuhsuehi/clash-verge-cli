@@ -48,6 +48,12 @@ async fn main() -> anyhow::Result<()> {
             cli::ProfileCommand::Update { uid, all } => {
                 commands::profile::update(uid.as_deref(), all).await?;
             }
+            cli::ProfileCommand::Remove { uid } => {
+                commands::profile::remove(&uid).await?;
+            }
+            cli::ProfileCommand::Rename { uid, name } => {
+                commands::profile::rename(&uid, &name).await?;
+            }
         },
     }
 
