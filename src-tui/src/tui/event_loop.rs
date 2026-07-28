@@ -2,7 +2,7 @@ use std::sync::LazyLock;
 use std::time::Duration;
 
 use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind};
-use serde_yaml_ng::{Mapping, Value};
+use serde_yaml_ng::Value;
 use tokio::sync::{Mutex, mpsc};
 use tokio::time;
 use tokio_stream::StreamExt as _;
@@ -635,6 +635,7 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                                             break;
                                         }
                                         Action::StartCore => {
+                                            let m = manager.clone();
                                             let tx = action_tx.clone();
                                             let enable_tun =
                                                 app.gui_config.enable_tun_mode.unwrap_or(false);
@@ -1569,7 +1570,7 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                             }
                         });
                     }
-                    Some(Action::ProfileImportFailed(error) => {
+                    Some(Action::ProfileImportFailed(error)) => {
                         app.status_msg = Some(format!("Import failed: {error}"));
                     }
                     Some(Action::ProfileUpdated { uid, is_current }) => {
