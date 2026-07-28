@@ -32,45 +32,44 @@ pub async fn graceful_stop(child_pid: u32, child: &mut tokio::process::Child) ->
     }
 }
 
-/// Graceful shutdown when we only have the PID (the Child handle was moved
-/// to the watcher). Signals the process directly and polls liveness via
-/// kill(pid, None) until the process exits or the timeout expires, then
-/// falls back to SIGKILL.
-pub async fn graceful_stop_by_pid(pid: u32) -> anyhow::Result<()> {
-    let nix_pid = Pid::from_raw(pid as i32);
-    kill(nix_pid, Signal::SIGTERM)?;
-
-    let start = std::time::Instant::now();
-    loop {
-        // kill(pid, None) is a no-signal check — ESRCH means the process is gone.
-        match kill(nix_pid, None) {
-            Err(nix::errno::Errno::ESRCH) => return Ok(()),
-            Err(e) => {
-                return Err(anyhow::anyhow!("error checking pid {pid} after SIGTERM: {e}"));
-            }
-            Ok(_) => {}
-        }
-        if start.elapsed() >= GRACEFUL_TIMEOUT {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+/// Stop a process we own by PID when the `Child` handle was moved into the watcher.
+///
+/// Polls `kill(pid, None)` for liveness after SIGTERM, then escalates to SIGKILL.
+pub async fn graceful_stop_by_pid(child_pid: u32) -> Result<()> {
+    let pid = Pid::from_raw(child_pid as i32);
+    match kill(pid, Signal::SIGTERM) {
+        Ok(()) => {}
+        Err(nix::errno::Errno::ESRCH) => return Ok(()),
+        Err(error) => return Err(error.into()),
     }
 
-    tracing::warn!("mihomo (pid {pid}) did not exit in 5s, sending SIGKILL");
-    kill(nix_pid, Signal::SIGKILL)?;
-
-    // Poll until reaped.
-    for _ in 0..50 {
-        match kill(nix_pid, None) {
+    let deadline = tokio::time::Instant::now() + GRACEFUL_TIMEOUT;
+    while tokio::time::Instant::now() < deadline {
+        match kill(pid, None) {
             Err(nix::errno::Errno::ESRCH) => return Ok(()),
-            Err(e) => {
-                return Err(anyhow::anyhow!("error checking pid {pid} after SIGKILL: {e}"));
-            }
-            Ok(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+            Err(error) => return Err(error.into()),
+            Ok(()) => tokio::time::sleep(Duration::from_millis(100)).await,
         }
     }
 
-    anyhow::bail!("failed to kill mihomo pid {pid} after SIGKILL");
+    tracing::warn!("mihomo pid {child_pid} did not exit in 5s, sending SIGKILL");
+    match kill(pid, Signal::SIGKILL) {
+        Ok(()) | Err(nix::errno::Errno::ESRCH) => {}
+        Err(error) => return Err(error.into()),
+    }
+
+    // Reap until gone (or give up after a short window).
+    let kill_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while tokio::time::Instant::now() < kill_deadline {
+        match kill(pid, None) {
+            Err(nix::errno::Errno::ESRCH) => return Ok(()),
+            Err(error) => {
+                return Err(anyhow::anyhow!("error checking pid {child_pid} after SIGKILL: {error}"));
+            }
+            Ok(()) => tokio::time::sleep(Duration::from_millis(100)).await,
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
