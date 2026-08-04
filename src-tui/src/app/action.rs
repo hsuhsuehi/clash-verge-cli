@@ -6,7 +6,12 @@ pub enum Action {
     StartCore,
     StopCore,
     RestartCore,
-    CoreStarted,
+    CoreStarted {
+        version: Option<String>,
+        binary_path: Option<String>,
+        /// system | cached | downloaded
+        binary_source: Option<String>,
+    },
     CoreExited(i32),
     CoreError(String),
     Quit,
@@ -103,7 +108,11 @@ mod tests {
         let _ = Action::StartCore;
         let _ = Action::StopCore;
         let _ = Action::RestartCore;
-        let _ = Action::CoreStarted;
+        let _ = Action::CoreStarted {
+            version: None,
+            binary_path: None,
+            binary_source: None,
+        };
         let _ = Action::CoreExited(0);
         let _ = Action::CoreExited(137);
         let _ = Action::CoreError("boom".to_string());

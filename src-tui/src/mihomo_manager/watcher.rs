@@ -1,9 +1,9 @@
 // Foundation module — `spawn_watcher` is wired up by Plan 02-03.
-// `dead_code` allow covers the function and helper. `unused_trait_names`
-// is suppressed because `BufReader` only needs the trait anonymously.
-#![allow(dead_code, unused_imports)]
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+use std::sync::atomic::Ordering;
 
 use tokio::io::{AsyncBufReadExt as _, BufReader};
 use tokio::process::Child;
@@ -20,7 +20,10 @@ use crate::mihomo_manager::manager::ManagerInner;
 /// `ManagerInner::try_auto_restart` after a small backoff. Otherwise
 /// the manager state is transitioned to `Error` and a
 /// `Action::CoreError` is sent.
-pub fn spawn_watcher(child: Child, inner: Arc<ManagerInner>) -> JoinHandle<()> {
+pub fn spawn_watcher(child: Child, inner: Arc<ManagerInner>, config_dir: &Path, socket_path: &Path) -> JoinHandle<()> {
+    // The auto-restart path outlives this function, so own the paths.
+    let config_dir = config_dir.to_path_buf();
+    let socket_path = socket_path.to_path_buf();
     tokio::spawn(async move {
         let mut child = child;
         let stdout = child.stdout.take();
@@ -43,20 +46,28 @@ pub fn spawn_watcher(child: Child, inner: Arc<ManagerInner>) -> JoinHandle<()> {
 
         tracing::info!("mihomo exited with code {exit_code}");
 
-        // Clear the child handle so the manager knows there is no live
-        // process to signal on stop.
-        *inner.child.lock() = None;
         *inner.pid.lock() = None;
 
         if let Some(tx) = inner.action_tx.lock().as_ref() {
             let _ = tx.send(Action::CoreExited(exit_code));
         }
 
+        // Skip auto-restart when stop() intentionally shut down the core.
+        if inner.expected_exit.swap(false, Ordering::SeqCst) {
+            *inner.state.lock() = CoreState::Stopped;
+            return;
+        }
+
         if inner.should_auto_restart() {
             inner.record_restart();
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            if let Err(e) = inner.try_auto_restart().await {
+            if let Err(e) = ManagerInner::try_auto_restart(Arc::clone(&inner), &config_dir, &socket_path).await {
                 tracing::error!("auto-restart failed: {e}");
+                let msg = format!("exited {exit_code} (restart failed)");
+                *inner.state.lock() = CoreState::Error(msg.clone());
+                if let Some(tx) = inner.action_tx.lock().as_ref() {
+                    let _ = tx.send(Action::CoreError(msg));
+                }
             }
         } else {
             let msg = format!("exited {exit_code}");

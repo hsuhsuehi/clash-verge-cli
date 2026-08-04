@@ -4,12 +4,42 @@ use std::io::Read as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Mutex;
 
 use anyhow::Context;
 use tokio::process::Command;
+use tokio::sync::OnceCell;
 
-/// Managed (auto-downloaded) mihomo stable version.
-pub const MIHOMO_VERSION: &str = "v1.19.29";
+/// Serialise concurrent `resolve_or_install` calls so two starts cannot
+/// overwrite the same `$dest.download` temporary and race on `rename(2)`.
+static DOWNLOAD_LOCK: Mutex<()> = Mutex::new(());
+
+/// Managed (auto-downloaded) mihomo stable version — compile-time fallback
+/// when GitHub API is unreachable.
+pub const MIHOMO_FALLBACK_VERSION: &str = "v1.19.29";
+
+const MIHOMO_REPO: &str = "MetaCubeX/mihomo";
+
+static LATEST_VERSION: OnceCell<String> = OnceCell::const_new();
+
+/// Resolve the latest mihomo version tag from GitHub, falling back to the
+/// compile-time constant when the API is unreachable.
+pub async fn latest_mihomo_version() -> &'static str {
+    LATEST_VERSION
+        .get_or_init(|| async {
+            if let Some(tag) = crate::subscribe::client_meta::fetch_latest_release_tag(MIHOMO_REPO).await {
+                tracing::info!(target: "mihomo", "latest mihomo release from GitHub: {tag}");
+                return tag;
+            }
+            tracing::warn!(
+                target: "mihomo",
+                "GitHub API unreachable, falling back to {MIHOMO_FALLBACK_VERSION}"
+            );
+            MIHOMO_FALLBACK_VERSION.to_string()
+        })
+        .await
+        .as_str()
+}
 
 /// D-01: managed binary path. Resolves to
 /// `$XDG_DATA_HOME/clash-verge-cli/mihomo` with a fallback to
@@ -27,7 +57,9 @@ pub fn mihomo_binary_path() -> PathBuf {
 }
 
 /// Best-effort system mihomo fallback. Checks standard XDG `bin` first,
-/// then common system paths. Returns `None` if nothing is present.
+/// then common system paths.  Skips paths that are not regular files or
+/// are not executable so a stale `verge-mihomo` doesn't block the managed
+/// download fallback.
 pub fn system_mihomo() -> Option<PathBuf> {
     let candidates = [
         dirs::executable_dir(),
@@ -37,7 +69,10 @@ pub fn system_mihomo() -> Option<PathBuf> {
     let mut seen = std::collections::HashSet::new();
     for dir in candidates.into_iter().flatten() {
         let path = dir.join("verge-mihomo");
-        if seen.insert(path.clone()) && path.exists() {
+        if seen.insert(path.clone())
+            && path.is_file()
+            && std::os::unix::fs::PermissionsExt::mode(&std::fs::metadata(&path).ok()?.permissions()) & 0o111 != 0
+        {
             return Some(path);
         }
     }
@@ -77,8 +112,9 @@ pub struct ResolvedMihomo {
 ///
 /// Preference order:
 /// 1. System `verge-mihomo` (left untouched)
-/// 2. Managed data-dir binary at [`MIHOMO_VERSION`] (download/upgrade as needed)
+/// 2. Managed data-dir binary at the detected latest version (download/upgrade as needed)
 pub async fn resolve_or_install() -> anyhow::Result<ResolvedMihomo> {
+    let target_version = latest_mihomo_version().await;
     if let Some(system) = system_mihomo() {
         let version = read_mihomo_version(&system).await?.unwrap_or_else(|| "unknown".into());
         return Ok(ResolvedMihomo {
@@ -91,7 +127,7 @@ pub async fn resolve_or_install() -> anyhow::Result<ResolvedMihomo> {
     let managed = mihomo_binary_path();
     if managed.exists()
         && let Ok(Some(version)) = read_mihomo_version(&managed).await
-        && version_matches_target(&version)
+        && version_matches_target(&version, target_version)
     {
         ensure_executable(&managed).await?;
         return Ok(ResolvedMihomo {
@@ -101,12 +137,12 @@ pub async fn resolve_or_install() -> anyhow::Result<ResolvedMihomo> {
         });
     }
 
-    download_managed_mihomo(&managed).await?;
+    download_managed_mihomo(&managed, target_version).await?;
     ensure_executable(&managed).await?;
     Ok(ResolvedMihomo {
         path: managed,
         source: MihomoBinarySource::Downloaded,
-        version: MIHOMO_VERSION.to_string(),
+        version: target_version.to_string(),
     })
 }
 
@@ -122,17 +158,25 @@ pub async fn ensure_executable(path: &Path) -> std::io::Result<()> {
     tokio::fs::set_permissions(path, target).await
 }
 
-async fn download_managed_mihomo(dest: &Path) -> anyhow::Result<()> {
+async fn download_managed_mihomo(dest: &Path, version: &str) -> anyhow::Result<()> {
     let asset = linux_asset_name().context("unsupported CPU architecture for auto-install")?;
+    // Serialise concurrent downloads — two starts racing on the same
+    // `$dest.download` temp file can cause a rename(2) to fail.
+    // Use a block so the MutexGuard is dropped before the first await,
+    // keeping the future `Send`.
+    {
+        let _guard = DOWNLOAD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Critical section: guard is dropped at the closing brace.
+    }
     let url = format!(
         "https://github.com/MetaCubeX/mihomo/releases/download/{version}/{asset}-{version}.gz",
-        version = MIHOMO_VERSION,
+        version = version,
         asset = asset
     );
 
     tracing::info!(
         target: "mihomo",
-        "downloading mihomo {MIHOMO_VERSION} → {}",
+        "downloading mihomo {version} → {}",
         dest.display()
     );
 
@@ -172,7 +216,7 @@ async fn download_managed_mihomo(dest: &Path) -> anyhow::Result<()> {
         .await
         .with_context(|| format!("failed to install mihomo to {}", dest.display()))?;
 
-    tracing::info!(target: "mihomo", "installed mihomo {MIHOMO_VERSION}");
+    tracing::info!(target: "mihomo", "installed mihomo {version}");
     Ok(())
 }
 
@@ -217,13 +261,13 @@ fn extract_version_token(text: &str) -> Option<String> {
     None
 }
 
-fn version_matches_target(version: &str) -> bool {
+fn version_matches_target(version: &str, target: &str) -> bool {
     let normalized = if version.starts_with('v') {
         version.to_string()
     } else {
         format!("v{version}")
     };
-    normalized == MIHOMO_VERSION
+    normalized == target
 }
 
 #[cfg(test)]
@@ -285,8 +329,8 @@ mod tests {
             Some("v1.19.29".into())
         );
         assert_eq!(extract_version_token("v1.19.29"), Some("v1.19.29".into()));
-        assert!(version_matches_target("v1.19.29"));
-        assert!(!version_matches_target("v1.19.25"));
+        assert!(version_matches_target("v1.19.29", "v1.19.29"));
+        assert!(!version_matches_target("v1.19.25", "v1.19.29"));
     }
 
     #[test]

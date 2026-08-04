@@ -1,18 +1,17 @@
 // Foundation module — public surface is wired up by Plan 02-03 (CLI
-// dispatch + start/stop wiring). The `dead_code` allow covers fields
-// and methods that are intentionally unused at the end of Plan 02-01.
-#![allow(dead_code)]
+// dispatch + start/stop wiring).
 
 use std::collections::VecDeque;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use anyhow::Context;
 use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
 use serde::Serialize;
-use tokio::process::{Child, Command};
+use tokio::process::Command;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::app::{Action, CoreState};
@@ -27,34 +26,44 @@ const MAX_RESTARTS_IN_WINDOW: usize = 3;
 /// Shared inner state of the MihomoManager. Cloning the `Arc<ManagerInner>`
 /// is cheap and lets background tasks (watcher, auto-restart) safely
 /// observe state without holding the manager itself.
+///
+/// `config_dir`, `socket_path`, and `secret` are owned by `MihomoManager`
+/// and passed in as `&Path` references to spawn operations, so they are
+/// not duplicated here.
 pub struct ManagerInner {
     pub state: Mutex<CoreState>,
-    pub child: Mutex<Option<Child>>,
     pub action_tx: Mutex<Option<UnboundedSender<Action>>>,
     pub started_at: Mutex<Option<DateTime<Utc>>>,
     pub restart_history: Mutex<VecDeque<DateTime<Utc>>>,
     pub pid: Mutex<Option<u32>>,
+    /// Set by `stop()` so the watcher knows this exit was intentional and
+    /// should NOT trigger an auto-restart.
+    pub expected_exit: AtomicBool,
 }
 
 impl ManagerInner {
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             state: Mutex::new(CoreState::Stopped),
-            child: Mutex::new(None),
             action_tx: Mutex::new(None),
             started_at: Mutex::new(None),
             restart_history: Mutex::new(VecDeque::new()),
             pid: Mutex::new(None),
+            expected_exit: AtomicBool::new(false),
         }
     }
 
     /// D-09: 3-in-60s policy. Returns `true` if another auto-restart is
     /// permitted right now, `false` if the cap has been hit.
+    ///
+    /// This is a pure predicate: expired entries are pruned but the check
+    /// is read-only for external callers.
     pub fn should_auto_restart(&self) -> bool {
         let now = Utc::now();
         let window_start = now - chrono::Duration::seconds(60);
 
         let mut history = self.restart_history.lock();
+        // Prune expired entries, then check the cap.
         while let Some(front) = history.front() {
             if *front < window_start {
                 history.pop_front();
@@ -73,11 +82,80 @@ impl ManagerInner {
         self.restart_history.lock().clear();
     }
 
-    /// Stub for Plan 03. Returns `Ok(())` so the watcher can call it
-    /// before the actual spawn logic lands.
-    #[allow(clippy::unused_async, dead_code)]
-    pub async fn try_auto_restart(&self) -> anyhow::Result<()> {
+    /// Spawn a mihomo child from a resolved binary, wire up the watcher,
+    /// and update the inner state.  Used by both `start` (initial launch)
+    /// and `try_auto_restart` (crash recovery).
+    fn spawn_and_watch(
+        resolved: &binary::ResolvedMihomo,
+        config_dir: &Path,
+        socket_path: &Path,
+        inner: Arc<ManagerInner>,
+    ) -> anyhow::Result<()> {
+        let mut command = Command::new(&resolved.path);
+        command.arg("-d").arg(config_dir);
+        if let Ok(config_path) = clash_verge_core::utils::dirs::clash_path()
+            && config_path.exists()
+        {
+            command.arg("-f").arg(config_path);
+        }
+        let child = command
+            .arg("-ext-ctl-unix")
+            .arg(socket_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(false)
+            .spawn()
+            .with_context(|| format!(
+                "failed to spawn mihomo from '{}' — check that the file exists, is executable (chmod +x), and is a valid binary. Try: ls -la '{}'",
+                resolved.path.display(), resolved.path.display()
+            ))?;
+
+        let pid = child.id().expect("child must have PID after spawn");
+
+        *inner.state.lock() = CoreState::Running;
+        *inner.pid.lock() = Some(pid);
+        *inner.started_at.lock() = Some(Utc::now());
+        inner.expected_exit.store(false, std::sync::atomic::Ordering::SeqCst);
+
+        if let Some(tx) = inner.action_tx.lock().as_ref() {
+            let _ = tx.send(Action::CoreStarted {
+                version: Some(resolved.version.clone()),
+                binary_path: Some(resolved.path.display().to_string()),
+                binary_source: Some(resolved.source.as_str().into()),
+            });
+        }
+
+        spawn_watcher(child, inner, config_dir, socket_path);
         Ok(())
+    }
+
+    /// Attempt to restart mihomo from the watcher after a crash.
+    ///
+    /// Resolves the binary (reusing cached managed or system path) and
+    /// delegates to [`spawn_and_watch`] so the spawn pipeline is shared
+    /// with [`MihomoManager::start`].
+    ///
+    /// `config_dir` and `socket_path` are passed in by the caller (the
+    /// outer `MihomoManager`) — the inner state is shared via the
+    /// existing `Arc<ManagerInner>` so restart history, action channel,
+    /// and the `expected_exit` flag carry over.
+    pub async fn try_auto_restart(
+        inner: Arc<ManagerInner>,
+        config_dir: &Path,
+        socket_path: &Path,
+    ) -> anyhow::Result<()> {
+        let resolved = binary::resolve_or_install()
+            .await
+            .context("auto-restart: failed to resolve mihomo binary")?;
+
+        tracing::info!(
+            target: "mihomo",
+            "auto-restarting mihomo {}",
+            resolved.version
+        );
+
+        Self::spawn_and_watch(&resolved, config_dir, socket_path, inner).context("auto-restart: failed to spawn mihomo")
     }
 }
 
@@ -99,8 +177,9 @@ impl MihomoManager {
     /// is usable for the common case.
     pub fn new(config_dir: PathBuf) -> Self {
         let socket_path = default_socket_path();
+        let inner = ManagerInner::new();
         Self {
-            inner: Arc::new(ManagerInner::new()),
+            inner: Arc::new(inner),
             config_dir,
             socket_path,
             secret: String::new(),
@@ -162,7 +241,7 @@ impl MihomoManager {
     }
 
     pub async fn try_auto_restart(&self) -> anyhow::Result<()> {
-        self.inner.try_auto_restart().await
+        ManagerInner::try_auto_restart(Arc::clone(&self.inner), &self.config_dir, &self.socket_path).await
     }
 
     pub fn set_secret(&mut self, secret: String) {
@@ -192,50 +271,8 @@ impl MihomoManager {
             .await
             .context("failed to resolve or auto-install mihomo core")?;
 
-        let mut command = Command::new(&resolved.path);
-        command.arg("-d").arg(&self.config_dir);
-        if let Ok(config_path) = clash_verge_core::utils::dirs::clash_path()
-            && config_path.exists()
-        {
-            command.arg("-f").arg(config_path);
-        }
-        // Keep mihomo I/O off the TTY. Without pipes, core logs overwrite the
-        // ratatui alternate screen (visible as garbled home-view output on start).
-        let child = command
-            .arg("-ext-ctl-unix")
-            .arg(&self.socket_path)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(false)
-            .spawn()
-            .with_context(|| format!(
-                "failed to spawn mihomo from '{}' — check that the file exists, is executable (chmod +x), and is a valid binary. Try: ls -la '{}'",
-                resolved.path.display(), resolved.path.display()
-            ))?;
-
-        let pid = child.id().expect("child must have PID after spawn");
-
-        {
-            let mut state = self.inner.state.lock();
-            *state = CoreState::Starting;
-        }
-        *self.inner.pid.lock() = Some(pid);
-        *self.inner.started_at.lock() = Some(Utc::now());
-
-        // Reset state to Running; the watcher will detect crashes
-        {
-            let mut state = self.inner.state.lock();
-            *state = CoreState::Running;
-        }
-
-        if let Some(tx) = self.inner.action_tx.lock().as_ref() {
-            let _ = tx.send(Action::CoreStarted);
-        }
-
-        // Spawn watcher — takes ownership of the Child handle
-        let inner = Arc::clone(&self.inner);
-        spawn_watcher(child, inner);
+        ManagerInner::spawn_and_watch(&resolved, &self.config_dir, &self.socket_path, Arc::clone(&self.inner))
+            .context("failed to spawn mihomo")?;
 
         Ok(resolved)
     }
@@ -244,25 +281,22 @@ impl MihomoManager {
     ///
     /// Returns Ok(()) even if no child was running (idempotent).
     ///
-    /// `start()` moves the `Child` into the exit watcher, so `inner.child` is
-    /// usually `None` while `inner.pid` is set. Prefer the Child wait path when
-    /// available; otherwise signal and poll by PID so restart cannot leak a core.
+    /// `start()` moves the `Child` into the exit watcher, so we only have
+    /// the PID to signal. `stop()` always uses the by-PID path.
     pub async fn stop(&self) -> anyhow::Result<()> {
+        // Set a flag so the watcher knows this was intentional and skips
+        // auto-restart.  The flag is cleared by the next successful start.
+        self.inner
+            .expected_exit
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         let pid = { *self.inner.pid.lock() };
-        let mut child_opt = self.inner.child.lock().take();
 
-        match (pid, child_opt.as_mut()) {
-            (Some(pid), Some(child)) => {
-                signal::graceful_stop(pid, child).await?;
-            }
-            (Some(pid), None) => {
-                signal::graceful_stop_by_pid(pid).await?;
-            }
-            _ => { /* already stopped — idempotent */ }
+        if let Some(pid) = pid {
+            signal::graceful_stop_by_pid(pid).await?;
         }
+        // No PID — already stopped or never started (idempotent).
 
         *self.inner.pid.lock() = None;
-        *self.inner.child.lock() = None;
         {
             let mut state = self.inner.state.lock();
             *state = CoreState::Stopped;

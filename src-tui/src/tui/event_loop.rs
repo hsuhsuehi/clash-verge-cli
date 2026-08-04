@@ -541,7 +541,11 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
     let tx = action_tx.clone();
     tokio::spawn(async move {
         if api.version().await.is_ok() {
-            let _ = tx.send(Action::CoreStarted);
+            let _ = tx.send(Action::CoreStarted {
+                version: None,
+                binary_path: None,
+                binary_source: None,
+            });
         }
         // If no controller is available, the user can press s to start one.
     });
@@ -1279,7 +1283,7 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
 
             action = action_rx.recv() => {
                 match action {
-                    Some(Action::CoreStarted) => {
+                    Some(Action::CoreStarted { .. }) => {
                         app.core_state = CoreState::Running;
                         app.core_pid = manager.pid();
                         let api = manager.api();
