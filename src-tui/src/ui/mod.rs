@@ -112,6 +112,40 @@ fn draw_overlay(frame: &mut ratatui::Frame<'_>, app: &App) {
             frame.render_widget(popup, area);
         }
         Overlay::Filter => {}
+        Overlay::CloseAllConnectionsConfirmation => {
+            let popup = Paragraph::new(vec![
+                Line::from(Span::styled(
+                    "Close ALL connections?",
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                )),
+                Line::from("This will terminate every active connection."),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "Enter = confirm | Esc/q = cancel",
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ])
+            .block(Block::bordered().title("Close All"));
+            frame.render_widget(popup, area);
+        }
+        Overlay::PasswordInput => {
+            let prompt = app.password_prompt.as_deref().unwrap_or("sudo").to_string();
+            let masked: String = "•".repeat(app.password_buffer.len());
+            let popup = Paragraph::new(vec![
+                Line::from(Span::styled(
+                    prompt,
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                )),
+                Line::from(format!("密码: {masked}")),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "Enter = 确认 | Esc/q = 取消",
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ])
+            .block(Block::bordered().title("管理员权限"));
+            frame.render_widget(popup, area);
+        }
     }
 }
 
@@ -265,7 +299,7 @@ mod tests {
             (View::Proxies, "Groups / Auto Nodes"),
             (View::Profiles, "Profile Detail"),
             (View::Connections, "Connection Detail"),
-            (View::Rules, "Limited provider support"),
+            (View::Rules, "Rule Providers"),
             (View::Logs, "ERROR"),
             (View::Unlock, "Limited support"),
             (View::Settings, "Runtime Settings"),
@@ -350,7 +384,7 @@ mod tests {
 
         app.view = View::Rules;
         let (rules, _) = render(&app, 120, 32);
-        assert!(rules.contains("Limited provider support"));
+        assert!(rules.contains("Rule Providers"));
 
         app.view = View::Unlock;
         let (unlock, _) = render(&app, 120, 32);
@@ -376,6 +410,17 @@ mod tests {
         let (rendered, _) = render(&app, 160, 40);
         assert!(rendered.contains("Delay: failed"));
         assert!(rendered.contains("Singapore failed"));
+    }
+
+    #[test]
+    fn batch_delay_progress_renders_in_the_proxies_view() {
+        let mut app = representative_app();
+        app.view = View::Proxies;
+        app.batch_delay = Some((2, 5));
+
+        let (rendered, rows) = render(&app, 120, 32);
+        assert!(rendered.contains("Batch delay test: 2/5"));
+        assert!(rows.iter().any(|row| row.contains("2/5")));
     }
 
     #[test]

@@ -52,10 +52,14 @@ impl ProfileStore {
     }
 
     /// Import a subscription URL under the shared IO lock.
-    pub async fn import_url_locked(url: &str, name: Option<&str>) -> anyhow::Result<PrfItem> {
+    pub async fn import_url_locked(
+        url: &str,
+        name: Option<&str>,
+        option: Option<&PrfOption>,
+    ) -> anyhow::Result<PrfItem> {
         let _guard = PROFILE_IO.lock().await;
         let mut store = Self::load_unlocked().await?;
-        store.import_url(url, name).await
+        store.import_url(url, name, option).await
     }
 
     /// Update one remote profile under the shared IO lock.
@@ -88,6 +92,42 @@ impl ProfileStore {
             }
         }
         Ok((updated, failed))
+    }
+
+    /// Delete a profile by UID under the shared IO lock.
+    /// Also removes associated chain fragment files.
+    pub async fn delete_locked(uid: &str) -> anyhow::Result<()> {
+        let _guard = PROFILE_IO.lock().await;
+        let mut store = Self::load_unlocked().await?;
+        let uid_key = smartstring::alias::String::from(uid);
+        let was_current = store.profiles.delete_item(&uid_key).await?;
+        let _ = was_current;
+        Ok(())
+    }
+
+    /// Restore a profile's `updated` timestamp (probe rollback path).
+    pub async fn restore_updated_locked(uid: &str, updated: usize) -> anyhow::Result<()> {
+        let _guard = PROFILE_IO.lock().await;
+        let mut store = Self::load_unlocked().await?;
+        let patch = PrfItem {
+            updated: Some(updated),
+            ..Default::default()
+        };
+        store.profiles.patch_item(&uid.into(), &patch).await?;
+        Ok(())
+    }
+
+    /// Rename a profile by UID under the shared IO lock.
+    pub async fn rename_locked(uid: &str, new_name: &str) -> anyhow::Result<()> {
+        let _guard = PROFILE_IO.lock().await;
+        let mut store = Self::load_unlocked().await?;
+        let uid_key = smartstring::alias::String::from(uid);
+        let patch = PrfItem {
+            name: Some(smartstring::alias::String::from(new_name)),
+            ..Default::default()
+        };
+        store.profiles.patch_item(&uid_key, &patch).await?;
+        Ok(())
     }
 
     /// Unlocked load — callers that mutate must use the `*_locked` helpers.
@@ -156,12 +196,37 @@ impl ProfileStore {
         self.profiles.save_file().await.context("failed to save profiles.yaml")
     }
 
-    /// Import a subscription URL.
-    pub async fn import_url(&mut self, url: &str, name: Option<&str>) -> anyhow::Result<PrfItem> {
-        let name = name.unwrap_or(url);
-        let item = from_url::from_url(url, name).await?;
-        self.append(item.clone()).await?;
-        Ok(item)
+    /// Append enhance fragments then the remote item, and persist.
+    pub async fn append_bundle(&mut self, bundle: RemoteProfileBundle) -> anyhow::Result<PrfItem> {
+        ensure_profile_storage().await?;
+        for mut fragment in bundle.fragments {
+            self.profiles
+                .append_item(&mut fragment)
+                .await
+                .context("failed to append profile fragment")?;
+        }
+        let mut item = bundle.item;
+        let saved = item.clone();
+        self.profiles
+            .append_item(&mut item)
+            .await
+            .context("failed to append remote profile")?;
+        self.profiles
+            .save_file()
+            .await
+            .context("failed to save profiles.yaml")?;
+        Ok(saved)
+    }
+
+    /// Import a subscription URL with GUI-style proxy fallbacks.
+    pub async fn import_url(
+        &mut self,
+        url: &str,
+        name: Option<&str>,
+        option: Option<&PrfOption>,
+    ) -> anyhow::Result<PrfItem> {
+        let bundle = from_url::import_with_fallback(url, name, option).await?;
+        self.append_bundle(bundle).await
     }
 
     /// Update a remote profile by UID. Returns whether it is the current profile.
@@ -237,20 +302,56 @@ mod tests {
     async fn import_url_persists_profiles_yaml_and_body() {
         let url = std::env::var("SUB_TEST_URL").expect("SUB_TEST_URL env var not set");
         let root = std::env::temp_dir().join(format!("clash-verge-cli-profile-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(root.join("profiles")).expect("temp profiles dir");
+        match std::fs::create_dir_all(root.join("profiles")) {
+            Ok(()) => {}
+            Err(error) => panic!("create temp profiles dir: {error}"),
+        }
         dirs::set_app_home_dir(root.clone());
+        let home = match dirs::app_home_dir() {
+            Ok(home) => home,
+            Err(error) => panic!("app home dir: {error}"),
+        };
+        assert_eq!(
+            home, root,
+            "test requires exclusive app home dir; another test may have claimed OnceLock"
+        );
 
         let mut store = ProfileStore {
             profiles: IProfiles::default(),
         };
-        let item = store.import_url(&url, Some("test-profile")).await.expect("import_url");
-        assert!(item.uid.is_some());
-        assert_eq!(item.itype.as_deref(), Some("remote"));
+        let uid = "Rpersist01ab";
+        let file_name = format!("{uid}.yaml");
+        let bundle = RemoteProfileBundle {
+            item: PrfItem {
+                uid: Some(uid.into()),
+                itype: Some("remote".into()),
+                name: Some("persist-demo".into()),
+                file: Some(file_name.clone().into()),
+                url: Some("https://example.com/sub.yaml".into()),
+                file_data: Some("proxies: []\n".into()),
+                ..Default::default()
+            },
+            fragments: vec![match PrfItem::from_merge(None) {
+                Ok(item) => item,
+                Err(error) => panic!("merge fragment: {error}"),
+            }],
+        };
 
-        let profiles_yaml = std::fs::read_to_string(root.join("profiles.yaml")).expect("profiles.yaml");
-        assert!(profiles_yaml.contains("test-profile"));
-        let file = item.file.as_ref().unwrap();
-        let body = std::fs::read_to_string(root.join("profiles").join(file.as_str())).expect("body");
+        match store.append_bundle(bundle).await {
+            Ok(_) => {}
+            Err(error) => panic!("append_bundle: {error}"),
+        }
+
+        let profiles_yaml = match std::fs::read_to_string(root.join("profiles.yaml")) {
+            Ok(text) => text,
+            Err(error) => panic!("read profiles.yaml: {error}"),
+        };
+        assert!(profiles_yaml.contains(uid));
+        assert!(profiles_yaml.contains("persist-demo"));
+        let body = match std::fs::read_to_string(root.join("profiles").join(&file_name)) {
+            Ok(text) => text,
+            Err(error) => panic!("read profile body: {error}"),
+        };
         assert!(body.contains("proxies:"));
         let _ = std::fs::remove_dir_all(&root);
     }

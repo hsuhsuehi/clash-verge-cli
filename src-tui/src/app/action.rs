@@ -1,5 +1,13 @@
 use super::View;
-use crate::mihomo_api::types::{ConnectionInfo, LogEntry, TrafficData};
+use crate::mihomo_api::types::{ConnectionInfo, LogEntry, Rule, RuleProvider, TrafficData};
+
+/// What config file to open in `$EDITOR`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditorTarget {
+    Verge,
+    #[allow(dead_code)]
+    Dns,
+}
 
 #[derive(Debug, Clone)]
 pub enum Action {
@@ -46,6 +54,11 @@ pub enum Action {
     NodeDelayAll,
     DelayResult(String, Option<u64>),
     DelayFailed(String, String),
+    /// Batch-only result events. Kept distinct from the single-node
+    /// `DelayResult`/`DelayFailed` so a single-node `t` result can never
+    /// advance or clear the active batch progress/guard.
+    BatchDelayResult(String, Option<u64>),
+    BatchDelayFailed(String, String),
 
     // Chain proxy
     ToggleChainMode,
@@ -76,6 +89,12 @@ pub enum Action {
         error: String,
     },
 
+    /// Close all connections via `DELETE /connections`.
+    RequestCloseAllConnections,
+    ConfirmCloseAllConnections,
+    AllConnectionsClosed,
+    CloseAllConnectionsFailed(String),
+
     /// Auto-update tick finished (clears in-flight guard).
     AutoUpdateFinished,
     CycleClashMode,
@@ -84,6 +103,50 @@ pub enum Action {
         announce: bool,
     },
     ModeChangeFailed(String),
+
+    // Settings editor via $EDITOR
+    /// Open the given config target in the user's editor.
+    OpenEditor(EditorTarget),
+    /// Editor session finished. `ok` is false if YAML validation failed and
+    /// the pre-edit snapshot was restored.
+    #[allow(dead_code)]
+    EditorFinished {
+        target: EditorTarget,
+        ok: bool,
+    },
+    /// Reload settings from disk after an editor session.
+    #[allow(dead_code)]
+    ReloadSettings,
+
+    // Rules
+    RulesRefresh,
+    RulesFetched(Vec<Rule>),
+    RulesFailed(String),
+    RuleProvidersRefresh,
+    RuleProvidersFetched(Vec<RuleProvider>),
+    RuleProvidersFailed(String),
+    RuleProviderUpdated(String),
+    RuleProviderUpdateFailed {
+        name: String,
+        error: String,
+    },
+
+    // Probe loop (dead-node detection → forced refresh / rollback notices).
+    ProbeNotice(String),
+    /// Read-only report of the resolved binary's TUN capability state
+    /// (refresh after setup / start / startup probe).
+    TunCapabilityState(bool),
+    /// TUN capability was applied (explicit one-time sudo); settings shows
+    /// (privileged).
+    TunPrivilegeApplied,
+    /// Password popup input (hidden buffer, `•` masked).
+    PasswordChar(char),
+    PasswordBackspace,
+    PasswordSubmit,
+    PasswordCancel,
+    /// The user chose the explicit Settings → TUN setup action and the
+    /// resolved binary needs capabilities; open the popup.
+    TunSetupRequested(std::path::PathBuf),
 }
 
 const fn _assert_send_sync() {

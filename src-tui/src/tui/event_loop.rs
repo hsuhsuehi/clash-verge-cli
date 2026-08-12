@@ -1,21 +1,21 @@
-use std::sync::LazyLock;
 use std::time::Duration;
 
 use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind};
 use serde_yaml_ng::Value;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::mpsc;
 use tokio::time;
 use tokio_stream::StreamExt as _;
 
-/// Serializes writes to the shared runtime `clash.yaml` staging/rename path.
-static RUNTIME_CONFIG_IO: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
-
 use crate::app::{
-    Action, App, CoreState, Focus, InputMode, Overlay, ProxyDisplayRow, View, first_selectable_proxy_group,
-    proxy_display_rows,
+    Action, App, CoreState, EditorTarget, Focus, InputMode, Overlay, ProxyDisplayRow, TunPending, View,
+    first_selectable_proxy_group, proxy_display_rows,
 };
 use crate::i18n::Language;
 use crate::mihomo_api::types::{LogEntry, TrafficData};
+use crate::runtime_config::{
+    RUNTIME_CONFIG_IO, commit_runtime_config, reload_config_file, reload_remote_profile, write_runtime_config,
+    write_runtime_config_unlocked,
+};
 use crate::tui::{TerminalGuard, input};
 
 fn key_context(app: &App) -> input::KeyContext<'_> {
@@ -62,39 +62,28 @@ async fn wait_for_mihomo_ready(api: &crate::mihomo_api::MihomoApi) {
             }
         }
     }
-    // Timeout — the user sees a loading state and can press r to manually refresh.
+
+    Err("Mihomo traffic stream closed".into())
 }
 
-async fn reload_remote_profile(
-    api: &crate::mihomo_api::MihomoApi,
-    item: &clash_verge_core::config::PrfItem,
-    enable_tun: bool,
-    core_running: bool,
+async fn receive_log_stream(
+    api: crate::mihomo_api::client::MihomoApi,
+    tx: mpsc::UnboundedSender<Action>,
 ) -> Result<(), String> {
-    let file = item
-        .file
-        .as_deref()
-        .ok_or_else(|| "remote profile is missing file".to_string())?;
-    let profile_path = clash_verge_core::utils::dirs::app_profiles_dir()
-        .map_err(|error| error.to_string())?
-        .join(file);
-    if !profile_path.exists() {
-        return Err(format!("profile file not found: {}", profile_path.display()));
+    let response = api.stream_logs("info").await.map_err(|error| error.to_string())?;
+    let mut stream = response.bytes_stream();
+    let mut buffer = Vec::new();
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| error.to_string())?;
+        for log in drain_ndjson::<LogEntry>(&mut buffer, &chunk)? {
+            if tx.send(Action::LogReceived(log)).is_err() {
+                return Ok(());
+            }
+        }
     }
 
-    let raw = tokio::fs::read_to_string(&profile_path)
-        .await
-        .map_err(|error| format!("failed to read {}: {error}", profile_path.display()))?;
-    let profile: serde_yaml_ng::Mapping = serde_yaml_ng::from_str(&raw)
-        .map_err(|error| format!("invalid YAML in {}: {error}", profile_path.display()))?;
-
-    // Control-plane snapshot happens inside commit_runtime_config under the IO lock.
-    commit_runtime_config(api, enable_tun, core_running, Some(item), |app_config| {
-        let control_plane = crate::enhance::snapshot_control_plane(&app_config);
-        Ok(crate::enhance::enforce_control_plane(profile, control_plane))
-    })
-    .await?;
-    Ok(())
+    Err("Mihomo log stream closed".into())
 }
 
 /// Write TUN-enabled runtime config and apply it under one IO lock.
@@ -104,17 +93,34 @@ async fn reload_remote_profile(
 /// when the Child sits in the watcher); attached cores API-reload the written file.
 async fn apply_tun_runtime(
     manager: &crate::mihomo_manager::manager::MihomoManager,
+    _guard: std::sync::Arc<tokio::sync::Mutex<crate::tui::TerminalGuard>>,
     owns_core: bool,
     enable_tun: bool,
-) -> Result<(), String> {
+) -> Result<bool, String> {
+    // TUN capability is ensured by the read-only preflight before this runs
+    // (Settings toggle checks the binary before persisting; the manager
+    // repeats the check before every TUN-enabled spawn). No askpass here:
+    // the password popup is only reachable from Settings → TUN setup.
     let _guard = RUNTIME_CONFIG_IO.lock().await;
     let config = clash_verge_core::config::IClashTemp::new().await.0;
     let path = write_runtime_config_unlocked(config, enable_tun).await?;
     if owns_core {
-        manager.restart().await.map(|_| ()).map_err(|error| error.to_string())
+        manager.restart().await.map(|_| ()).map_err(|error| error.to_string())?;
     } else {
-        reload_config_file(&manager.api(), &path).await
+        reload_config_file(&manager.api(), &path).await?;
     }
+    Ok(false)
+}
+
+/// Write the runtime config (with TUN flag) and start the core. Shared by
+/// the StartCore key path and the resolve-then-start path.
+async fn start_core_with_tun(
+    manager: &crate::mihomo_manager::manager::MihomoManager,
+    enable_tun: bool,
+) -> Result<(), String> {
+    let config = clash_verge_core::config::IClashTemp::new().await.0;
+    write_runtime_config(config, enable_tun).await?;
+    manager.start().await.map(|_| ()).map_err(|error| error.to_string())
 }
 
 /// Persist TUN flag into a freshly loaded runtime config (core stopped path).
@@ -124,117 +130,29 @@ async fn write_tun_runtime(enable_tun: bool) -> Result<std::path::PathBuf, Strin
     write_runtime_config_unlocked(config, enable_tun).await
 }
 
-async fn restore_selected_nodes(api: &crate::mihomo_api::MihomoApi, item: &clash_verge_core::config::PrfItem) {
-    let Some(selected) = item.selected.as_ref() else {
+/// Handle a submitted password for the explicit TUN setup action.
+///
+/// A submit with no pending setup is a stale duplicate Enter (e.g. the
+/// second Enter of a double-press after the popup already closed): it is
+/// ignored instead of aborting the TUI event loop. The spawned task only
+/// runs when a pending setup actually exists.
+fn handle_password_submit(app: &mut App, action_tx: &mpsc::UnboundedSender<Action>) {
+    let Some(pending) = app.pending_tun.take() else {
         return;
     };
-    for entry in selected {
-        let Some(group) = entry.name.as_deref() else {
-            continue;
-        };
-        let Some(node) = entry.now.as_deref() else {
-            continue;
-        };
-        if let Err(error) = api.select_proxy(group, node).await {
-            tracing::debug!(target: "profile", "restore selected {group}/{node}: {error}");
+    let password: String = app.password_buffer.drain(..).collect();
+    app.overlay = None;
+    let tx = action_tx.clone();
+    tokio::spawn(async move {
+        match crate::commands::privilege::apply_tun_capability_with_password(&pending.binary, &password) {
+            Ok(()) => {
+                let _ = tx.send(Action::TunPrivilegeApplied);
+            }
+            Err(error) => {
+                let _ = tx.send(Action::CoreError(error.to_string()));
+            }
         }
-    }
-}
-
-/// Write runtime config under the shared IO lock (no reload).
-async fn write_runtime_config(config: serde_yaml_ng::Mapping, enable_tun: bool) -> Result<std::path::PathBuf, String> {
-    let _guard = RUNTIME_CONFIG_IO.lock().await;
-    write_runtime_config_unlocked(config, enable_tun).await
-}
-
-/// Backup → build (from a fresh on-disk snapshot) → write → reload/rollback.
-///
-/// `build` receives the latest `clash.yaml` mapping while `RUNTIME_CONFIG_IO` is held,
-/// so concurrent mode/TUN commits are not overwritten by a stale pre-lock snapshot.
-async fn commit_runtime_config<F>(
-    api: &crate::mihomo_api::MihomoApi,
-    enable_tun: bool,
-    core_running: bool,
-    restore_item: Option<&clash_verge_core::config::PrfItem>,
-    build: F,
-) -> Result<std::path::PathBuf, String>
-where
-    F: FnOnce(serde_yaml_ng::Mapping) -> Result<serde_yaml_ng::Mapping, String>,
-{
-    let _guard = RUNTIME_CONFIG_IO.lock().await;
-    let app_config = clash_verge_core::config::IClashTemp::new().await.0;
-    let config = build(app_config)?;
-    let path = clash_verge_core::utils::dirs::clash_path().map_err(|error| error.to_string())?;
-    let previous = if core_running && path.exists() {
-        Some(
-            tokio::fs::read(&path)
-                .await
-                .map_err(|error| format!("failed to back up {}: {error}", path.display()))?,
-        )
-    } else {
-        None
-    };
-
-    write_runtime_config_unlocked(config, enable_tun).await?;
-    if !core_running {
-        // Keep the newly selected runtime config for the next Start; do not API-reload
-        // (or roll it back) while no controller is available.
-        return Ok(path);
-    }
-    if let Err(error) = reload_config_file(api, &path).await {
-        if let Some(previous) = previous {
-            let _ = tokio::fs::write(&path, previous).await;
-            let _ = reload_config_file(api, &path).await;
-            return Err(format!("{error}; restored the previous config"));
-        }
-        return Err(error);
-    }
-    if let Some(item) = restore_item {
-        restore_selected_nodes(api, item).await;
-    }
-    Ok(path)
-}
-
-async fn write_runtime_config_unlocked(
-    mut config: serde_yaml_ng::Mapping,
-    enable_tun: bool,
-) -> Result<std::path::PathBuf, String> {
-    config = crate::enhance::prepare_runtime_config(config, enable_tun);
-    let yaml = serde_yaml_ng::to_string(&config).map_err(|error| error.to_string())?;
-    let path = clash_verge_core::utils::dirs::clash_path().map_err(|error| error.to_string())?;
-    let temporary_path = path.with_extension(format!("yaml.tui-runtime.{}.tmp", uuid::Uuid::new_v4()));
-
-    #[cfg(unix)]
-    let permissions = {
-        use std::os::unix::fs::PermissionsExt;
-        if tokio::fs::try_exists(&path).await.unwrap_or(false) {
-            tokio::fs::metadata(&path).await.ok().map(|meta| meta.permissions())
-        } else {
-            Some(std::fs::Permissions::from_mode(0o600))
-        }
-    };
-
-    tokio::fs::write(&temporary_path, yaml)
-        .await
-        .map_err(|error| format!("failed to stage {}: {error}", temporary_path.display()))?;
-
-    #[cfg(unix)]
-    if let Some(permissions) = permissions {
-        tokio::fs::set_permissions(&temporary_path, permissions)
-            .await
-            .map_err(|error| format!("failed to set permissions on {}: {error}", temporary_path.display()))?;
-    }
-
-    #[cfg(windows)]
-    if tokio::fs::try_exists(&path).await.unwrap_or(false) {
-        tokio::fs::remove_file(&path)
-            .await
-            .map_err(|error| format!("failed to remove {}: {error}", path.display()))?;
-    }
-    tokio::fs::rename(&temporary_path, &path)
-        .await
-        .map_err(|error| format!("failed to replace {}: {error}", path.display()))?;
-    Ok(path)
+    });
 }
 
 fn next_clash_mode(current: &str) -> &'static str {
@@ -487,17 +405,104 @@ fn find_node_at_index(
         .map(|(group, node)| (group.to_string(), node.to_string()))
 }
 
-/// Collect all node names from all proxy groups.
-fn all_node_names(groups: &std::collections::HashMap<String, crate::mihomo_api::types::ProxyGroup>) -> Vec<String> {
-    let mut names: Vec<_> = groups
+/// Policy pseudo-nodes that must never receive a delay test.
+const BATCH_POLICY_PSEUDO_NODES: [&str; 5] = ["DIRECT", "REJECT", "REJECT-DROP", "PASS", "COMPATIBLE"];
+
+/// Maximum number of concurrent delay requests for one batch.
+const BATCH_MAX_CONCURRENCY: usize = 4;
+
+/// Collect the deduplicated set of real leaf proxy targets for a batch delay
+/// test. A name is a real leaf only if it is not a policy pseudo-node and it
+/// is not itself a proxy group (a group is a key whose `all` is present).
+/// The result is sorted for a stable, deterministic test order.
+fn batch_delay_targets(
+    groups: &std::collections::HashMap<String, crate::mihomo_api::types::ProxyGroup>,
+) -> Vec<String> {
+    let mut targets: Vec<String> = groups
         .values()
         .filter_map(|group| group.all.as_ref().filter(|nodes| !nodes.is_empty()))
         .flatten()
+        .filter(|name| {
+            let name = name.as_str();
+            !BATCH_POLICY_PSEUDO_NODES.contains(&name) && groups.get(name).is_none_or(|group| group.all.is_none())
+        })
         .cloned()
         .collect();
-    names.sort_unstable();
-    names.dedup();
-    names
+    targets.sort_unstable();
+    targets.dedup();
+    targets
+}
+
+/// Outcome of deciding what to do when the user presses the batch-delay shortcut.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BatchDelayOutcome {
+    /// No batch is running; `targets` are the freshly computed leaf targets.
+    Started { targets: Vec<String> },
+    /// A batch is already running; report its current progress instead of
+    /// scheduling another one.
+    InProgress { done: usize, total: usize },
+    /// The testable set is empty; do not create any delay request.
+    NoTargets,
+}
+
+/// Decide what the batch-delay shortcut does with the current app state.
+/// Guarded so a second invocation never schedules a second batch.
+fn begin_batch_delay(app: &mut App) -> BatchDelayOutcome {
+    if let Some((done, total)) = app.batch_delay {
+        return BatchDelayOutcome::InProgress { done, total };
+    }
+    let targets = batch_delay_targets(&app.proxy_groups);
+    if targets.is_empty() {
+        return BatchDelayOutcome::NoTargets;
+    }
+    app.batch_delay = Some((0, targets.len()));
+    BatchDelayOutcome::Started { targets }
+}
+
+/// Count one finished batch result. Only batch result events call this, so the
+/// batch never blocks on any individual node; when the last result arrives the
+/// in-progress marker (and duplicate-start guard) is cleared.
+fn advance_batch(app: &mut App) {
+    let Some((done, total)) = app.batch_delay else {
+        return;
+    };
+    let next = done + 1;
+    if next >= total {
+        app.batch_delay = None;
+    } else {
+        app.batch_delay = Some((next, total));
+    }
+    app.status_msg = Some(format!("{}: {next}/{total}", app.tr("proxies.batch_delay")));
+}
+
+/// Record one single-node delay result in the shared delay map and status bar.
+/// Never touches batch progress: a single-node `t` result must not advance or
+/// clear the active batch.
+fn note_delay_result(app: &mut App, name: String, delay: Option<u64>) {
+    app.delay_map.insert(name, delay);
+    if let Some(delay) = delay {
+        app.status_msg = Some(format!("Delay: {delay}ms"));
+    }
+}
+
+/// Record one single-node delay failure. Same contract as [`note_delay_result`].
+fn note_delay_failed(app: &mut App, name: String, error: String) {
+    app.delay_map.insert(name.clone(), None);
+    app.status_msg = Some(format!("Delay failed for {name}: {error}"));
+}
+
+/// Record one batch delay result: identical per-node rendering to the
+/// single-node path, then advance the active batch progress.
+fn note_batch_delay_result(app: &mut App, name: String, delay: Option<u64>) {
+    note_delay_result(app, name, delay);
+    advance_batch(app);
+}
+
+/// Record one batch delay failure: identical per-node rendering to the
+/// single-node path, then advance the active batch progress.
+fn note_batch_delay_failed(app: &mut App, name: String, error: String) {
+    note_delay_failed(app, name, error);
+    advance_batch(app);
 }
 
 /// Count total flat items in proxy groups: one per group header + one per node.
@@ -509,7 +514,7 @@ fn count_flat_nodes(
 }
 
 pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
-    let mut guard = TerminalGuard::new()?;
+    let guard = std::sync::Arc::new(tokio::sync::Mutex::new(TerminalGuard::new()?));
     let (action_tx, mut action_rx) = mpsc::unbounded_channel::<Action>();
 
     let manager = crate::commands::build_manager(config_dir).await?;
@@ -534,9 +539,17 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
     let mut auto_update_tick = time::interval(Duration::from_secs(30));
     auto_update_tick.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     let mut auto_update_in_flight = false;
+    // Re-read profiles.yaml every 5 min so external interval edits (GUI/user)
+    // take effect without restarting the TUI.
+    let mut profiles_refresh_tick = time::interval(Duration::from_secs(300));
+    profiles_refresh_tick.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+    let auto_update_scheduler = std::sync::Arc::new(tokio::sync::Mutex::new(
+        crate::subscribe::scheduler::AutoUpdateScheduler::new(),
+    ));
     let mut rendered_view = app.view;
 
-    // Try connecting to existing mihomo (may be running from GUI)
+    // Detect a core the CLI itself started earlier (standalone socket).
+    // The GUI is never probed.
     let api = manager.api();
     let tx = action_tx.clone();
     tokio::spawn(async move {
@@ -550,24 +563,30 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
         // If no controller is available, the user can press s to start one.
     });
 
-    // Catch Ctrl-C — send Quit through the channel so stop() runs on the
-    // normal exit path and TerminalGuard::drop restores the terminal.
-    let manager_for_signal = manager.clone();
-    let quit_tx = action_tx.clone();
-    tokio::spawn(async move {
-        let _ = tokio::signal::ctrl_c().await;
-        tracing::info!("SIGINT received, stopping mihomo");
-        let _ = manager_for_signal.stop().await;
-        let _ = quit_tx.send(Action::Quit);
-    });
+    // Read-only TUN capability state for the Settings view (no download,
+    // no sudo). Uses the already-resolved binary or the no-download
+    // candidate; refreshes again on CoreStarted / after explicit setup.
+    {
+        let m = manager.clone();
+        let tx = action_tx.clone();
+        tokio::spawn(async move {
+            let binary = m
+                .binary_path()
+                .or_else(crate::mihomo_manager::binary::candidate_without_install);
+            if let Some(path) = binary {
+                let _ = tx.send(Action::TunCapabilityState(
+                    crate::commands::privilege::has_tun_capability(&path),
+                ));
+            }
+        });
+    }
 
-    let mut should_quit = false;
     loop {
         tokio::select! {
             maybe_event = events.next() => {
                 match maybe_event {
                     Some(Ok(Event::Resize(_, _))) => {
-                        guard.reset_screen()?;
+                        guard.lock().await.reset_screen()?;
                     }
                     Some(Ok(Event::Key(key))) if key.kind != KeyEventKind::Release => {
                         match &app.input_mode {
@@ -634,28 +653,57 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                                     }
                                 } else if let Some(action) = input::map_key(key, key_context(&app)) {
                                     match action {
-                                        Action::Quit => {
-                                            should_quit = true;
-                                            break;
+                                        // Password popup input is handled uniformly in the action
+                                        // channel match (buffer updates, submit, cancel).
+                                        Action::PasswordChar(_)
+                                        | Action::PasswordBackspace
+                                        | Action::PasswordSubmit
+                                        | Action::PasswordCancel => {
+                                            let _ = action_tx.send(action);
                                         }
+                                        Action::Quit => break,
                                         Action::StartCore => {
-                                            let m = manager.clone();
-                                            let tx = action_tx.clone();
+                                            // Privilege-free daily path: resolve the binary,
+                                            // run the read-only TUN preflight (no sudo/setcap/
+                                            // askpass — the manager repeats it before spawn), and
+                                            // start. A missing capability fails with a recoverable
+                                            // error naming `tun setup`; the password popup is only
+                                            // reachable via Settings → TUN setup.
                                             let enable_tun =
                                                 app.gui_config.enable_tun_mode.unwrap_or(false);
+                                            app.core_state = CoreState::Starting;
+                                            app.status_msg =
+                                                Some(app.tr("home.starting_core").into());
+                                            let m = manager.clone();
+                                            let tx = action_tx.clone();
                                             tokio::spawn(async move {
-                                                let config =
-                                                    clash_verge_core::config::IClashTemp::new().await.0;
-                                                if let Err(error) =
-                                                    write_runtime_config(config, enable_tun).await
+                                                if enable_tun {
+                                                    match crate::mihomo_manager::binary::resolve_or_install()
+                                                        .await
+                                                    {
+                                                        Ok(resolved) => {
+                                                            if let Err(error) = crate::commands::privilege::require_tun_capability(
+                                                                &resolved.path,
+                                                            ) {
+                                                                let _ = tx.send(Action::CoreError(
+                                                                    error.to_string(),
+                                                                ));
+                                                                return;
+                                                            }
+                                                        }
+                                                        Err(error) => {
+                                                            let _ = tx.send(Action::CoreError(
+                                                                error.to_string(),
+                                                            ));
+                                                            return;
+                                                        }
+                                                    }
+                                                }
+                                                if let Err(error) = start_core_with_tun(&m, enable_tun).await
                                                 {
                                                     let _ = tx.send(Action::CoreError(error));
-                                                    return;
                                                 }
-                                                if let Err(error) = m.start().await {
-                                                    let _ = tx.send(Action::CoreError(error.to_string()));
-                                                }
-                                                // On success, manager emits CoreStarted with launch details.
+                                                // On success, manager emits CoreStarted.
                                             });
                                         }
                                         Action::StopCore => {
@@ -772,12 +820,11 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                                             match app.view {
                                                 View::Profiles => {
                                                     // Profile tab: switch profile
-                                                    if let Some(item) =
-                                                        app.profiles.get(app.selected_index).filter(|item| item.uid.is_some())
+                                                    if let Some(item) = app.profiles.get(app.selected_index)
+                                                        && let Some(uid) = item.uid.clone()
                                                     {
                                                         let name = item.name.clone().unwrap_or_default();
                                                         let itype = item.itype.clone().unwrap_or_default();
-                                                        let uid = item.uid.clone().expect("filtered uid");
                                                         app.status_msg = Some(format!("Switching to {name}..."));
                                                         let api = manager.api();
                                                         let tx = action_tx.clone();
@@ -946,6 +993,30 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                                                     }
                                                 }
                                                 View::Connections => begin_connection_close(&mut app),
+                                                View::Rules => {
+                                                    // Activate on rules view: update selected rule provider.
+                                                    if app.rules_focus_providers
+                                                        && let Some(provider) = app.rule_providers.get(app.rules_selected_index)
+                                                    {
+                                                        let name = provider.name.clone();
+                                                        app.status_msg = Some(format!("Updating rule provider {name}..."));
+                                                        let api = manager.api();
+                                                        let tx = action_tx.clone();
+                                                        tokio::spawn(async move {
+                                                            match api.update_rule_provider(&name).await {
+                                                                Ok(()) => {
+                                                                    let _ = tx.send(Action::RuleProviderUpdated(name));
+                                                                }
+                                                                Err(error) => {
+                                                                    let _ = tx.send(Action::RuleProviderUpdateFailed {
+                                                                        name,
+                                                                        error: error.to_string(),
+                                                                    });
+                                                                }
+                                                            }
+                                                        });
+                                                    }
+                                                }
                                                 View::Settings => {
                                                     match app.settings_selected_index {
                                                         0 => {
@@ -1021,9 +1092,27 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                                                                 }
                                                             }
                                                         }
-                                                        2 => {
+                                                        2 => 'tun_toggle: {
                                                             let enabled =
                                                                 !app.gui_config.enable_tun_mode.unwrap_or(false);
+                                                            if enabled {
+                                                                // Read-only preflight BEFORE persisting: never write a TUN-on
+                                                                // config that cannot run. Uses the already-resolved binary or
+                                                                // the no-download candidate; no sudo/setcap/askpass here — the
+                                                                // spawn preflight repeats the check authoritatively.
+                                                                let known = manager.binary_path().or_else(
+                                                                    crate::mihomo_manager::binary::candidate_without_install,
+                                                                );
+                                                                if let Some(binary) = known
+                                                                    && let Err(error) = crate::commands::privilege::require_tun_capability(&binary)
+                                                                {
+                                                                    app.status_msg = Some(format!(
+                                                                        "{}: {error}",
+                                                                        app.tr("settings.save_failed")
+                                                                    ));
+                                                                    break 'tun_toggle;
+                                                                }
+                                                            }
                                                             let mut updated = app.gui_config.clone();
                                                             updated.enable_tun_mode = Some(enabled);
                                                             match updated.save_file().await {
@@ -1044,16 +1133,17 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                                                                         }
                                                                         let m = manager.clone();
                                                                         let tx = action_tx.clone();
+                                                                        let g = guard.clone();
                                                                         tokio::spawn(async move {
-                                                                            if let Err(error) =
-                                                                                apply_tun_runtime(&m, owns_core, enabled)
-                                                                                    .await
-                                                                            {
-                                                                                let _ = tx.send(Action::CoreError(
-                                                                                    error,
-                                                                                ));
-                                                                            } else if !owns_core {
-                                                                                let _ = tx.send(Action::ProxiesRefresh);
+                                                                            match apply_tun_runtime(&m, g, owns_core, enabled).await {
+                                                                                Ok(_) => {
+                                                                                    if !owns_core {
+                                                                                        let _ = tx.send(Action::ProxiesRefresh);
+                                                                                    }
+                                                                                }
+                                                                                Err(error) => {
+                                                                                    let _ = tx.send(Action::CoreError(error));
+                                                                                }
                                                                             }
                                                                         });
                                                                     } else if let Err(error) =
@@ -1067,9 +1157,9 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                                                                         // Core is stopped: persist only; apply on next start.
                                                                         app.status_msg = Some(
                                                                             if enabled {
-                                                                                app.tr("settings.tun_saved_on")
+                                                                                app.tr("settings.tun_on")
                                                                             } else {
-                                                                                app.tr("settings.tun_saved_off")
+                                                                                app.tr("settings.tun_off")
                                                                             }
                                                                             .into(),
                                                                         );
@@ -1083,7 +1173,47 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                                                                 }
                                                             }
                                                         }
-                                                        _ => {
+                                                        3 => 'tun_setup: {
+                                                            // Explicit TUN setup — the ONLY TUI authorization action.
+                                                            // Start/toggle never open the password popup; this row does.
+                                                            let known = manager.binary_path().or_else(
+                                                                crate::mihomo_manager::binary::candidate_without_install,
+                                                            );
+                                                            if let Some(binary) = known
+                                                                && crate::commands::privilege::has_tun_capability(&binary)
+                                                            {
+                                                                app.tun_privileged = true;
+                                                                app.status_msg =
+                                                                    Some(app.tr("settings.tun_setup_present").into());
+                                                                break 'tun_setup;
+                                                            }
+                                                            let tx = action_tx.clone();
+                                                            tokio::spawn(async move {
+                                                                match crate::mihomo_manager::binary::resolve_or_install()
+                                                                    .await
+                                                                {
+                                                                    Ok(resolved) => {
+                                                                        if crate::commands::privilege::has_tun_capability(
+                                                                            &resolved.path,
+                                                                        ) {
+                                                                            let _ = tx.send(
+                                                                                Action::TunCapabilityState(true),
+                                                                            );
+                                                                        } else {
+                                                                            let _ = tx.send(
+                                                                                Action::TunSetupRequested(resolved.path),
+                                                                            );
+                                                                        }
+                                                                    }
+                                                                    Err(error) => {
+                                                                        let _ = tx.send(Action::CoreError(
+                                                                            error.to_string(),
+                                                                        ));
+                                                                    }
+                                                                }
+                                                            });
+                                                        }
+                                                        4 => {
                                                             let next = next_clash_mode(&app.clash_mode);
                                                             let api = manager.api();
                                                             let tx = action_tx.clone();
@@ -1103,6 +1233,7 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                                                                 }
                                                             });
                                                         }
+                                                        _ => {}
                                                     }
                                                 }
                                                 _ => {}
@@ -1138,11 +1269,25 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                                                 View::Logs => {
                                                     let _ = action_tx.send(Action::LogsRefresh);
                                                 }
+                                                View::Rules => {
+                                                    if app.rules.is_empty() {
+                                                        let _ = action_tx.send(Action::RulesRefresh);
+                                                    }
+                                                    if app.rule_providers.is_empty() {
+                                                        let _ = action_tx.send(Action::RuleProvidersRefresh);
+                                                    }
+                                                }
                                                 _ => {}
                                             }
                                         }
                                         Action::CycleFocus => {
-                                            app.focus = app.focus.cycle();
+                                            // On Rules view, cycle between Rules ↔ Providers panels.
+                                            if app.view == View::Rules && app.focus == Focus::Content {
+                                                app.rules_focus_providers = !app.rules_focus_providers;
+                                                app.rules_selected_index = 0;
+                                            } else {
+                                                app.focus = app.focus.cycle();
+                                            }
                                         }
                                         Action::FocusMenu => {
                                             app.focus = Focus::Menu;
@@ -1167,6 +1312,12 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                                         Action::RequestCloseConnection => {
                                             begin_connection_close(&mut app);
                                         }
+                                        Action::RequestCloseAllConnections => {
+                                            app.overlay = Some(Overlay::CloseAllConnectionsConfirmation);
+                                            app.status_msg =
+                                                Some("Close ALL connections? Press Enter to confirm".into());
+                                            app.focus = Focus::Content;
+                                        }
                                         Action::ConfirmCloseConnection(id) => {
                                             if close_confirmation_is_current(&app, &id) {
                                                 let _ = action_tx.send(Action::ConfirmCloseConnection(id));
@@ -1175,17 +1326,52 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                                             }
                                         }
                                         Action::NodeDelayAll => {
-                                            let api = manager.api();
+                                            let api = std::sync::Arc::new(manager.api());
                                             let tx = action_tx.clone();
-                                            let all_names: Vec<String> = all_node_names(&app.proxy_groups);
-                                            tokio::spawn(async move {
-                                                for name in all_names {
-                                                    match api.delay_test(&name, "http://www.gstatic.com/generate_204", 5000).await {
-                                                        Ok(d) => { let _ = tx.send(Action::DelayResult(name, Some(d.delay))); }
-                                                        Err(error) => { let _ = tx.send(Action::DelayFailed(name, error.to_string())); }
-                                                    }
+                                            match begin_batch_delay(&mut app) {
+                                                BatchDelayOutcome::Started { targets } => {
+                                                    app.status_msg = Some(format!(
+                                                        "{}: 0/{}",
+                                                        app.tr("proxies.batch_delay"),
+                                                        targets.len()
+                                                    ));
+                                                    tokio::spawn(async move {
+                                                        let semaphore = std::sync::Arc::new(
+                                                            tokio::sync::Semaphore::new(BATCH_MAX_CONCURRENCY),
+                                                        );
+                                                        let mut handles = Vec::new();
+                                                        for name in targets {
+                                                            let permit =
+                                                                match semaphore.clone().acquire_owned().await {
+                                                                    Ok(permit) => permit,
+                                                                    // Semaphore closed: stop scheduling further requests.
+                                                                    Err(_) => break,
+                                                                };
+                                                            let api = api.clone();
+                                                            let tx = tx.clone();
+                                                            handles.push(tokio::spawn(async move {
+                                                                let _permit = permit;
+                                                                match api.delay_test(&name, "http://www.gstatic.com/generate_204", 5000).await {
+                                                                    Ok(d) => { let _ = tx.send(Action::BatchDelayResult(name, Some(d.delay))); }
+                                                                    Err(error) => { let _ = tx.send(Action::BatchDelayFailed(name, error.to_string())); }
+                                                                }
+                                                            }));
+                                                        }
+                                                        for handle in handles {
+                                                            let _ = handle.await;
+                                                        }
+                                                    });
                                                 }
-                                            });
+                                                BatchDelayOutcome::InProgress { done, total } => {
+                                                    app.status_msg = Some(format!(
+                                                        "{}: {done}/{total}",
+                                                        app.tr("proxies.batch_delay")
+                                                    ));
+                                                }
+                                                BatchDelayOutcome::NoTargets => {
+                                                    app.status_msg = Some(app.tr("proxies.no_testable").into());
+                                                }
+                                            }
                                         }
                                         Action::UpdateProfile => {
                                             app.status_msg = Some("Updating subscriptions...".into());
@@ -1270,6 +1456,46 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                                         Action::CycleClashMode => {
                                             let _ = action_tx.send(Action::CycleClashMode);
                                         }
+                                        Action::OpenEditor(target) => {
+                                            let config_path = match target {
+                                                EditorTarget::Verge => {
+                                                    clash_verge_core::utils::dirs::verge_path().ok()
+                                                }
+                                                EditorTarget::Dns => None,
+                                            };
+                                            if let Some(path) = config_path {
+                                                let snapshot = crate::editor::snapshot(&path).ok();
+                                                let mut guard = guard.lock().await;
+                                                let edit_result = crate::editor::edit_file_blocking(&mut guard, &path);
+                                                match edit_result {
+                                                    Ok(()) => {
+                                                        match crate::editor::validate_yaml(&path) {
+                                                            Ok(()) => {
+                                                                app.gui_config = clash_verge_core::config::IVerge::new().await;
+                                                                app.language = Language::from_config(app.gui_config.language.as_deref());
+                                                                // Reload DNS enable from the (possibly edited) verge config.
+                                                                if let EditorTarget::Dns = target {
+                                                                    // DNS editing not yet wired as a separate file.
+                                                                }
+                                                                app.status_msg = Some("Config saved and validated".into());
+                                                            }
+                                                            Err(e) => {
+                                                                if let Some(data) = snapshot {
+                                                                    let _ = crate::editor::restore_snapshot(&path, &data);
+                                                                }
+                                                                app.gui_config = clash_verge_core::config::IVerge::new().await;
+                                                                app.status_msg = Some(format!("Invalid YAML, restored: {e}"));
+                                                            }
+                                                        }
+                                                    }
+                                                    Err(e) => {
+                                                        app.status_msg = Some(format!("Editor error: {e}"));
+                                                    }
+                                                }
+                                            } else {
+                                                app.status_msg = Some("Config file path not available".into());
+                                            }
+                                        }
                                         _ => {}
                                     }
                                 }
@@ -1286,17 +1512,56 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                     Some(Action::CoreStarted { .. }) => {
                         app.core_state = CoreState::Running;
                         app.core_pid = manager.pid();
-                        let api = manager.api();
-                        let tx = action_tx.clone();
-                        tokio::spawn(async move {
-                            // Poll /version until the mihomo API is actually
-                            // responsive — spawning the process doesn't mean
-                            // it's ready to serve proxied requests yet.
-                            wait_for_mihomo_ready(&api).await;
-                            let _ = tx.send(Action::ProxiesRefresh);
-                            let _ = tx.send(Action::TrafficRefresh);
-                            let _ = tx.send(Action::ConnectionsRefresh);
-                            let _ = tx.send(Action::LogsRefresh);
+                        // Keep the Settings capability state in sync with the
+                        // binary that actually got spawned (may have changed
+                        // after an upgrade or a fresh setup).
+                        if let Some(path) = manager.binary_path() {
+                            app.tun_privileged =
+                                crate::commands::privilege::has_tun_capability(&path);
+                        }
+                        if let Some(version) = version.clone() {
+                            app.core_version = Some(version);
+                        } else if app.core_version.is_none() {
+                            // Attached to an existing controller — ask the API for version.
+                            let api = manager.api();
+                            let tx = action_tx.clone();
+                            tokio::spawn(async move {
+                                if let Ok(v) = api.version().await {
+                                    let _ = tx.send(Action::CoreStarted {
+                                        version: Some(v.version),
+                                        binary_path: None,
+                                        binary_source: None,
+                                    });
+                                }
+                            });
+                        }
+
+                        let pid = app.core_pid.map(|p| p.to_string()).unwrap_or_else(|| "-".into());
+                        app.status_msg = Some(match binary_source.as_deref() {
+                            Some("downloaded") => format!(
+                                "{} · {} · {} · pid {pid}",
+                                app.tr("home.core_started"),
+                                version.as_deref().unwrap_or("mihomo"),
+                                app.tr("home.core_downloaded"),
+                            ),
+                            Some("cached") => format!(
+                                "{} · {} · {} · pid {pid}",
+                                app.tr("home.core_started"),
+                                version.as_deref().unwrap_or("mihomo"),
+                                app.tr("home.core_cached"),
+                            ),
+                            Some("system") => format!(
+                                "{} · {} · {} · pid {pid}",
+                                app.tr("home.core_started"),
+                                version.as_deref().unwrap_or("mihomo"),
+                                app.tr("home.core_system"),
+                            ),
+                            _ if version.is_some() => format!(
+                                "{} · {} · pid {pid}",
+                                app.tr("home.core_started"),
+                                version.as_deref().unwrap_or("mihomo"),
+                            ),
+                            _ => app.tr("home.core_attached").into(),
                         });
                         let api = manager.api();
                         let tx = action_tx.clone();
@@ -1417,14 +1682,16 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                         app.runtime_errors.proxies = Some(error);
                     }
                     Some(Action::DelayResult(name, delay)) => {
-                        app.delay_map.insert(name, delay);
-                        if let Some(delay) = delay {
-                            app.status_msg = Some(format!("Delay: {delay}ms"));
-                        }
+                        note_delay_result(&mut app, name, delay);
                     }
                     Some(Action::DelayFailed(name, error)) => {
-                        app.delay_map.insert(name.clone(), None);
-                        app.status_msg = Some(format!("Delay failed for {name}: {error}"));
+                        note_delay_failed(&mut app, name, error);
+                    }
+                    Some(Action::BatchDelayResult(name, delay)) => {
+                        note_batch_delay_result(&mut app, name, delay);
+                    }
+                    Some(Action::BatchDelayFailed(name, error)) => {
+                        note_batch_delay_failed(&mut app, name, error);
                     }
                     Some(Action::ChainApplied(nodes)) => {
                         app.chain_mode = false;
@@ -1559,10 +1826,95 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                     Some(Action::CloseConnectionFailed { id, error }) => {
                         app.runtime_errors.connections = Some(format!("Could not close {id}: {error}"));
                     }
+                    Some(Action::ConfirmCloseAllConnections)
+                        if app.overlay == Some(Overlay::CloseAllConnectionsConfirmation) =>
+                    {
+                        app.overlay = None;
+                        app.status_msg = Some("Closing all connections...".into());
+                        let api = manager.api();
+                        let tx = action_tx.clone();
+                        tokio::spawn(async move {
+                            match api.close_all_connections().await {
+                                Ok(()) => {
+                                    let _ = tx.send(Action::AllConnectionsClosed);
+                                }
+                                Err(error) => {
+                                    let _ = tx.send(Action::CloseAllConnectionsFailed(error.to_string()));
+                                }
+                            }
+                        });
+                    }
+                    Some(Action::AllConnectionsClosed) => {
+                        app.status_msg = Some("All connections closed".into());
+                        let _ = action_tx.send(Action::ConnectionsRefresh);
+                    }
+                    Some(Action::CloseAllConnectionsFailed(error)) => {
+                        app.status_msg = Some(format!("Close all failed: {error}"));
+                    }
+                    Some(Action::RulesRefresh) if !app.rules_loading => {
+                        app.rules_loading = true;
+                        app.rules_error = None;
+                        let api = manager.api();
+                        let tx = action_tx.clone();
+                        tokio::spawn(async move {
+                            match api.get_rules().await {
+                                Ok(resp) => {
+                                    let _ = tx.send(Action::RulesFetched(resp.rules));
+                                }
+                                Err(error) => {
+                                    let _ = tx.send(Action::RulesFailed(error.to_string()));
+                                }
+                            }
+                        });
+                    }
+                    Some(Action::RulesFetched(rules)) => {
+                        app.rules_loading = false;
+                        app.rules = rules;
+                        app.rules_selected_index = app.rules_selected_index.min(app.rules.len().saturating_sub(1));
+                    }
+                    Some(Action::RulesFailed(error)) => {
+                        app.rules_loading = false;
+                        app.rules_error = Some(error);
+                    }
+                    Some(Action::RuleProvidersRefresh) if !app.rule_providers_loading => {
+                        app.rule_providers_loading = true;
+                        app.rule_providers_error = None;
+                        let api = manager.api();
+                        let tx = action_tx.clone();
+                        tokio::spawn(async move {
+                            match api.get_rule_providers().await {
+                                Ok(resp) => {
+                                    let providers: Vec<_> = resp.providers.into_values().collect();
+                                    let _ = tx.send(Action::RuleProvidersFetched(providers));
+                                }
+                                Err(error) => {
+                                    let _ = tx.send(Action::RuleProvidersFailed(error.to_string()));
+                                }
+                            }
+                        });
+                    }
+                    Some(Action::RuleProvidersFetched(providers)) => {
+                        app.rule_providers_loading = false;
+                        app.rule_providers = providers;
+                        app.rules_selected_index = app.rules_selected_index.min(app.rule_providers.len().saturating_sub(1));
+                    }
+                    Some(Action::RuleProvidersFailed(error)) => {
+                        app.rule_providers_loading = false;
+                        app.rule_providers_error = Some(error);
+                    }
+                    Some(Action::RuleProviderUpdated(name)) => {
+                        app.status_msg = Some(format!("Rule provider updated: {name}"));
+                        let _ = action_tx.send(Action::RuleProvidersRefresh);
+                    }
+                    Some(Action::RuleProviderUpdateFailed { name, error }) => {
+                        app.status_msg = Some(format!("Failed to update {name}: {error}"));
+                    }
                     Some(Action::ConfirmImport(url)) => {
                         let tx = action_tx.clone();
                         tokio::spawn(async move {
-                            match crate::profile_store::store::ProfileStore::import_url_locked(&url, None)
+                            match crate::profile_store::store::ProfileStore::import_url_locked(
+                                &url, None, None,
+                            )
                                 .await
                             {
                                 Ok(_) => {
@@ -1593,26 +1945,20 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                             let enable_tun = app.gui_config.enable_tun_mode.unwrap_or(false);
                             let core_running = app.core_state == CoreState::Running;
                             tokio::spawn(async move {
-                                if let Ok(store) =
-                                    crate::profile_store::store::ProfileStore::snapshot().await
-                                    && let Some(item) = store
-                                        .items()
-                                        .into_iter()
-                                        .find(|item| item.uid.as_deref() == Some(reload_uid.as_str()))
+                                match crate::subscribe::scheduler::reload_current_profile(
+                                    &api, &reload_uid, enable_tun, core_running,
+                                )
+                                .await
                                 {
-                                    if let Err(error) = reload_remote_profile(
-                                        &api,
-                                        &item,
-                                        enable_tun,
-                                        core_running,
-                                    )
-                                    .await
-                                    {
+                                    Ok(()) => {
+                                        if core_running {
+                                            let _ = tx.send(Action::ProxiesRefresh);
+                                        }
+                                    }
+                                    Err(error) => {
                                         let _ = tx.send(Action::CoreError(format!(
                                             "profile reload: {error}"
                                         )));
-                                    } else if core_running {
-                                        let _ = tx.send(Action::ProxiesRefresh);
                                     }
                                 }
                             });
@@ -1650,6 +1996,37 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                     Some(Action::ModeChangeFailed(error)) => {
                         app.status_msg = Some(format!("{}: {error}", app.tr("common.failed")));
                     }
+                    Some(Action::ProbeNotice(message)) => {
+                        app.status_msg = Some(message);
+                    }
+                    Some(Action::TunPrivilegeApplied) => {
+                        app.tun_privileged = true;
+                        app.status_msg = Some("TUN capability installed (one-time sudo)".into());
+                    }
+                    Some(Action::TunCapabilityState(privileged)) => {
+                        app.tun_privileged = privileged;
+                    }
+                    Some(Action::TunSetupRequested(binary)) => {
+                        app.password_prompt = Some(app.tr("settings.tun_setup_prompt").into());
+                        app.password_buffer.clear();
+                        app.pending_tun = Some(TunPending { binary });
+                        app.overlay = Some(Overlay::PasswordInput);
+                    }
+                    Some(Action::PasswordChar(c)) => {
+                        app.password_buffer.push(c);
+                    }
+                    Some(Action::PasswordBackspace) => {
+                        app.password_buffer.pop();
+                    }
+                    Some(Action::PasswordCancel) => {
+                        app.overlay = None;
+                        app.pending_tun = None;
+                        app.password_buffer.clear();
+                        app.status_msg = Some("TUN setup cancelled".into());
+                    }
+                    Some(Action::PasswordSubmit) => {
+                        handle_password_submit(&mut app, &action_tx);
+                    }
                     Some(Action::AutoUpdateFinished) => {
                         auto_update_in_flight = false;
                     }
@@ -1662,10 +2039,10 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                 if app.view != rendered_view {
                     // Orca's terminal renderer can retain differential cells across
                     // alternate-screen view changes. Force one clean repaint per route.
-                    guard.reset_screen()?;
+                    guard.lock().await.reset_screen()?;
                     rendered_view = app.view;
                 }
-                guard.terminal_mut().draw(|f| crate::ui::draw(f, &app))?;
+                guard.lock().await.terminal_mut().draw(|f| crate::ui::draw(f, &app))?;
             }
 
             _ = runtime_refresh_tick.tick(), if app.core_state == CoreState::Running => {
@@ -1682,28 +2059,49 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
             }
 
             _ = auto_update_tick.tick(), if !auto_update_in_flight => {
-                let due = crate::subscribe::timer::due_remote_uids(&app.profiles);
-                if due.is_empty() {
-                    continue;
-                }
                 auto_update_in_flight = true;
+                let scheduler = auto_update_scheduler.clone();
                 let tx = action_tx.clone();
+                let api = manager.api();
+                let enable_tun = app.gui_config.enable_tun_mode.unwrap_or(false);
+                let core_running = app.core_state == CoreState::Running;
                 tokio::spawn(async move {
-                    match crate::profile_store::store::ProfileStore::update_remotes_locked(&due).await {
-                        Ok((updated, failed)) => {
-                            for (uid, is_current) in updated {
-                                let _ = tx.send(Action::ProfileUpdated { uid, is_current });
-                            }
-                            for (_uid, error) in failed {
-                                let _ = tx.send(Action::ProfileUpdateFailed(error));
-                            }
-                        }
-                        Err(error) => {
-                            let _ = tx.send(Action::ProfileUpdateFailed(error.to_string()));
-                        }
+                    let (outcome, probe) = {
+                        let mut scheduler = scheduler.lock().await;
+                        (
+                            scheduler.tick().await,
+                            scheduler.probe(&api, enable_tun, core_running).await,
+                        )
+                    };
+                    for (uid, is_current) in outcome.updated {
+                        let _ = tx.send(Action::ProfileUpdated { uid, is_current });
+                    }
+                    for (_uid, error) in outcome.failed {
+                        let _ = tx.send(Action::ProfileUpdateFailed(error));
+                    }
+                    if let Some(error) = outcome.errored {
+                        let _ = tx.send(Action::ProfileUpdateFailed(error));
+                    }
+                    if probe.forced_refresh {
+                        let notice = if probe.rolled_back {
+                            "probe: selected node vanished — refresh rolled back".to_string()
+                        } else if probe.may_be_down {
+                            "probe: subscription may be down".to_string()
+                        } else {
+                            "probe: node recovered — subscription refreshed".to_string()
+                        };
+                        let _ = tx.send(Action::ProbeNotice(notice));
                     }
                     let _ = tx.send(Action::AutoUpdateFinished);
                 });
+            }
+
+            _ = profiles_refresh_tick.tick() => {
+                // Re-read profiles.yaml so external interval edits (GUI/user)
+                // take effect without restarting the TUI.
+                if let Ok(store) = crate::profile_store::store::ProfileStore::snapshot().await {
+                    app.profiles = store.items();
+                }
             }
         }
     }
@@ -1723,29 +2121,168 @@ mod tests {
 
     use super::*;
 
+    fn proxy_group(all: Option<Vec<String>>) -> crate::mihomo_api::types::ProxyGroup {
+        crate::mihomo_api::types::ProxyGroup {
+            group_type: "Selector".to_string(),
+            now: None,
+            all,
+            history: None,
+        }
+    }
+
     #[test]
-    fn all_node_names_deduplicates_choices_shared_by_multiple_groups() {
+    fn batch_delay_targets_deduplicates_leaf_nodes_in_stable_order() {
         let mut groups = HashMap::new();
         groups.insert(
             "first".to_string(),
-            crate::mihomo_api::types::ProxyGroup {
-                group_type: "Selector".to_string(),
-                now: None,
-                all: Some(vec!["Tokyo".to_string(), "Singapore".to_string()]),
-                history: None,
-            },
+            proxy_group(Some(vec!["Tokyo".to_string(), "Singapore".to_string()])),
         );
         groups.insert(
             "second".to_string(),
-            crate::mihomo_api::types::ProxyGroup {
-                group_type: "Selector".to_string(),
-                now: None,
-                all: Some(vec!["Tokyo".to_string(), "Los Angeles".to_string()]),
-                history: None,
-            },
+            proxy_group(Some(vec!["Tokyo".to_string(), "Los Angeles".to_string()])),
         );
 
-        assert_eq!(all_node_names(&groups), vec!["Los Angeles", "Singapore", "Tokyo"]);
+        assert_eq!(batch_delay_targets(&groups), vec!["Los Angeles", "Singapore", "Tokyo"]);
+    }
+
+    #[test]
+    fn batch_delay_targets_excludes_pseudo_nodes_and_nested_group_names() {
+        let mut groups = HashMap::new();
+        // "nested" is itself a group key, so it must never be a target.
+        groups.insert("nested".to_string(), proxy_group(Some(vec!["Tokyo".to_string()])));
+        groups.insert(
+            "root".to_string(),
+            proxy_group(Some(vec![
+                "Tokyo".to_string(),
+                "nested".to_string(),
+                "DIRECT".to_string(),
+                "REJECT".to_string(),
+                "REJECT-DROP".to_string(),
+                "PASS".to_string(),
+                "COMPATIBLE".to_string(),
+            ])),
+        );
+        // A leaf node that is also a key with `all: None` stays testable.
+        groups.insert("Tokyo".to_string(), proxy_group(None));
+
+        assert_eq!(batch_delay_targets(&groups), vec!["Tokyo"]);
+    }
+
+    #[test]
+    fn batch_delay_targets_is_empty_when_nothing_is_testable() {
+        let mut groups = HashMap::new();
+        groups.insert("DIRECT".to_string(), proxy_group(Some(Vec::new())));
+        groups.insert("only-group".to_string(), proxy_group(Some(vec!["DIRECT".to_string()])));
+
+        assert!(batch_delay_targets(&groups).is_empty());
+    }
+
+    #[test]
+    fn begin_batch_delay_rejects_duplicate_starts_and_reports_progress() {
+        let mut app = App::new();
+        app.batch_delay = Some((2, 7));
+
+        match begin_batch_delay(&mut app) {
+            BatchDelayOutcome::InProgress { done, total } => {
+                assert_eq!((done, total), (2, 7));
+            }
+            outcome => panic!("expected InProgress, got {outcome:?}"),
+        }
+        assert_eq!(app.batch_delay, Some((2, 7)), "in-flight state must stay untouched");
+    }
+
+    #[test]
+    fn begin_batch_delay_reports_no_targets_without_creating_a_task() {
+        let mut app = App::new();
+
+        assert_eq!(begin_batch_delay(&mut app), BatchDelayOutcome::NoTargets);
+        assert_eq!(app.batch_delay, None);
+    }
+
+    #[test]
+    fn begin_batch_delay_starts_a_batch_with_filtered_targets() {
+        let mut app = App::new();
+        app.proxy_groups.insert(
+            "root".to_string(),
+            proxy_group(Some(vec!["DIRECT".to_string(), "Tokyo".to_string()])),
+        );
+        app.proxy_groups.insert("Tokyo".to_string(), proxy_group(None));
+
+        match begin_batch_delay(&mut app) {
+            BatchDelayOutcome::Started { targets } => {
+                assert_eq!(targets, vec!["Tokyo"]);
+            }
+            outcome => panic!("expected Started, got {outcome:?}"),
+        }
+        assert_eq!(app.batch_delay, Some((0, 1)));
+    }
+
+    #[test]
+    fn advance_batch_counts_results_and_clears_on_completion() {
+        let mut app = App::new();
+        app.batch_delay = Some((0, 3));
+
+        advance_batch(&mut app);
+        assert_eq!(app.batch_delay, Some((1, 3)));
+
+        advance_batch(&mut app);
+        assert_eq!(app.batch_delay, Some((2, 3)));
+
+        advance_batch(&mut app);
+        assert_eq!(app.batch_delay, None, "last result clears the in-progress marker");
+    }
+
+    #[test]
+    fn single_node_result_during_batch_does_not_advance_or_clear_the_guard() {
+        let mut app = App::new();
+        app.batch_delay = Some((1, 5));
+        app.proxy_groups
+            .insert("root".to_string(), proxy_group(Some(vec!["Tokyo".to_string()])));
+        app.proxy_groups.insert("Tokyo".to_string(), proxy_group(None));
+
+        // A single-node `t` result lands while the batch is still running.
+        note_delay_result(&mut app, "Tokyo".to_string(), Some(42));
+        assert_eq!(
+            app.delay_map.get("Tokyo"),
+            Some(&Some(42)),
+            "single-node result still renders"
+        );
+        assert_eq!(
+            app.batch_delay,
+            Some((1, 5)),
+            "single-node result must not advance batch progress"
+        );
+        assert_eq!(
+            begin_batch_delay(&mut app),
+            BatchDelayOutcome::InProgress { done: 1, total: 5 },
+            "the batch guard must stay armed so a second batch cannot start early"
+        );
+
+        // The batch's own result still advances progress.
+        note_batch_delay_result(&mut app, "Tokyo".to_string(), Some(43));
+        assert_eq!(app.batch_delay, Some((2, 5)));
+    }
+
+    #[test]
+    fn single_node_failure_during_batch_does_not_advance_or_clear_the_guard() {
+        let mut app = App::new();
+        app.batch_delay = Some((3, 4));
+
+        note_delay_failed(&mut app, "Tokyo".to_string(), "timeout".to_string());
+        assert_eq!(
+            app.delay_map.get("Tokyo"),
+            Some(&None),
+            "failure state still renders as failed"
+        );
+        assert_eq!(
+            app.batch_delay,
+            Some((3, 4)),
+            "single-node failure must not advance batch progress"
+        );
+
+        // The batch's own failure completes the batch and clears the guard.
+        note_batch_delay_failed(&mut app, "Singapore".to_string(), "timeout".to_string());
+        assert_eq!(app.batch_delay, None, "batch failure on the last node clears the guard");
     }
 
     #[test]
@@ -1768,10 +2305,16 @@ mod tests {
     fn ndjson_parser_buffers_partial_records_and_preserves_order() {
         let mut buffer = Vec::new();
 
-        let initial = drain_ndjson::<TrafficData>(&mut buffer, br#"{"up":1,"down":2}"#).expect("partial record");
+        let initial = match drain_ndjson::<TrafficData>(&mut buffer, br#"{"up":1,"down":2}"#) {
+            Ok(records) => records,
+            Err(error) => panic!("partial record: {error}"),
+        };
         assert!(initial.is_empty());
 
-        let entries = drain_ndjson::<TrafficData>(&mut buffer, b"\n{\"up\":3,\"down\":4}\n").expect("complete records");
+        let entries = match drain_ndjson::<TrafficData>(&mut buffer, b"\n{\"up\":3,\"down\":4}\n") {
+            Ok(records) => records,
+            Err(error) => panic!("complete records: {error}"),
+        };
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].up, 1);
         assert_eq!(entries[1].down, 4);
@@ -1780,11 +2323,34 @@ mod tests {
     #[test]
     fn ndjson_parser_ignores_blank_lines() {
         let mut buffer = Vec::new();
-        let entries = drain_ndjson::<LogEntry>(&mut buffer, b"\n {\"type\":\"info\",\"payload\":\"ready\"}\n\n")
-            .expect("valid log record");
+        let entries = match drain_ndjson::<LogEntry>(&mut buffer, b"\n {\"type\":\"info\",\"payload\":\"ready\"}\n\n") {
+            Ok(records) => records,
+            Err(error) => panic!("valid log record: {error}"),
+        };
 
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].level, "info");
         assert_eq!(entries[0].payload, "ready");
+    }
+
+    #[test]
+    fn duplicate_password_submit_without_pending_is_ignored() {
+        // Regression: a stale second Enter after the popup closed used to hit
+        // `break` and exit the whole TUI loop. Now it must return without
+        // spawning anything (no tokio runtime here) and leave state intact.
+        let mut app = App::new();
+        app.overlay = Some(Overlay::PasswordInput); // stale overlay from a closed popup
+        app.password_buffer = vec!['x'];
+        app.pending_tun = None;
+
+        let (tx, _rx) = mpsc::unbounded_channel::<Action>();
+        handle_password_submit(&mut app, &tx);
+
+        assert!(app.pending_tun.is_none(), "nothing may be created by a stale submit");
+        assert_eq!(
+            app.overlay,
+            Some(Overlay::PasswordInput),
+            "stale overlay is left untouched"
+        );
     }
 }
